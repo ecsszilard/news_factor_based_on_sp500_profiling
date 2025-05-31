@@ -5,522 +5,633 @@ from tensorflow.keras import layers, Model
 from tensorflow.keras.layers import Input, Dense, Attention, Concatenate, Dropout, BatchNormalization
 from tensorflow.keras.optimizers import Adam
 from sklearn.metrics.pairwise import cosine_similarity
+from scipy.spatial.distance import cdist
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import random
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from collections import defaultdict
 
 # Logging beállítás
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class IntegratedNewsAnalyzer:
-    def __init__(self, embedding_dim=768, company_dim=128, latent_dim=64, impact_vector_dim=8):
+@dataclass
+class CefsetEntity:
+    """Cefset entitás (cég vagy központi bank)"""
+    symbol: str
+    market_cap: float  # USD-ben
+    sector: str
+    embedding: np.ndarray
+    fuzzy_membership: Dict[str, float]  # fuzzy halmaztagság különböző kategóriákban
+    m2_supply: Optional[float] = None  # csak FED-nél
+
+class CefsetNewsAnalyzer:
+    def __init__(self, embedding_dim=768, company_dim=128, latent_dim=64, 
+                 keyword_dim=256, fuzzy_dim=32, capitalization_vector_dim=16):
         """
-        Integrált hírfaktor és cégelemző rendszer
+        Cefset-alapú integrált hírfaktor és cégelemző rendszer
         
         Args:
             embedding_dim: Hír embedding dimenzió
             company_dim: Cég profil dimenzió  
             latent_dim: Látens reprezentáció dimenzió
-            impact_vector_dim: Hatásvektor dimenzió (árfolyam + piaci eltolódások)
+            keyword_dim: Kulcsszó embedding dimenzió
+            fuzzy_dim: Fuzzy halmaz dimenzió
+            capitalization_vector_dim: Kapitalizációs hatásvektor dimenzió
         """
         self.embedding_dim = embedding_dim
         self.company_dim = company_dim
         self.latent_dim = latent_dim
-        self.impact_vector_dim = impact_vector_dim
+        self.keyword_dim = keyword_dim
+        self.fuzzy_dim = fuzzy_dim
+        self.capitalization_vector_dim = capitalization_vector_dim
         
-        # Szimulált cégek és profilok
-        self.symbols = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'TSLA', 'META', 'NVDA']
-        self.company_profiles = {
-            sym: np.random.rand(company_dim) for sym in self.symbols
+        # Kibővített entitások FED-del
+        self.symbols = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'TSLA', 'META', 'NVDA', 'FED']
+        
+        # Market cap adatok (milliárd USD) - FED esetén M2 money supply
+        self.base_market_caps = {
+            'AAPL': 3200.0, 'MSFT': 2800.0, 'GOOG': 1600.0, 'AMZN': 1400.0,
+            'TSLA': 800.0, 'META': 750.0, 'NVDA': 1800.0,
+            'FED': 21000.0  # M2 money supply (trillions -> billions)
         }
         
-        # Szektor információk (relatív piaci eltolódásokhoz)
+        # Szektor mapping
         self.sector_mapping = {
             'AAPL': 'tech_hardware', 'MSFT': 'tech_software', 'GOOG': 'tech_internet',
             'AMZN': 'tech_ecommerce', 'TSLA': 'automotive', 'META': 'tech_social',
-            'NVDA': 'tech_semiconductor'
+            'NVDA': 'tech_semiconductor', 'FED': 'monetary_policy'
         }
         
-        # Modell komponensek
-        self.news_encoder = self.build_news_encoder()
+        # Cefset entitások inicializálása
+        self.cefsets = self.initialize_cefsets()
+        
+        # Kulcsszó kategóriák és embeddings
+        self.keyword_categories = {
+            'earnings': ['revenue', 'profit', 'earnings', 'quarterly', 'financial'],
+            'product': ['launch', 'product', 'innovation', 'technology', 'patent'],
+            'market': ['market', 'competition', 'share', 'customer', 'demand'],
+            'regulation': ['regulation', 'policy', 'government', 'tax', 'compliance'],
+            'monetary': ['interest', 'inflation', 'fed', 'monetary', 'rate', 'stimulus'],
+            'risk': ['risk', 'volatility', 'uncertainty', 'crisis', 'debt'],
+            'growth': ['growth', 'expansion', 'acquisition', 'investment', 'scale'],
+            'sentiment': ['bullish', 'bearish', 'optimistic', 'pessimistic', 'confidence']
+        }
+        
+        self.keyword_embeddings = {
+            category: np.random.rand(self.keyword_dim) 
+            for category in self.keyword_categories
+        }
+        
+        # Fuzzy halmazok definiálása
+        self.fuzzy_sets = {
+            'tech_giants': {'AAPL': 0.9, 'MSFT': 0.9, 'GOOG': 0.8, 'META': 0.8, 'AMZN': 0.7},
+            'growth_stocks': {'TSLA': 0.9, 'NVDA': 0.8, 'META': 0.7, 'AMZN': 0.6},
+            'value_stocks': {'AAPL': 0.7, 'MSFT': 0.8, 'GOOG': 0.6},
+            'ai_exposed': {'NVDA': 0.95, 'MSFT': 0.8, 'GOOG': 0.7, 'TSLA': 0.6},
+            'interest_sensitive': {'TSLA': 0.8, 'META': 0.7, 'FED': 1.0, 'NVDA': 0.6},
+            'defensive': {'AAPL': 0.6, 'MSFT': 0.7, 'FED': 0.3},
+            'monetary_policy': {'FED': 1.0, 'AAPL': 0.2, 'TSLA': 0.4}
+        }
+        
+        # Neural network komponensek
+        self.keyword_encoder = self.build_keyword_encoder()
         self.company_encoder = self.build_company_encoder()
-        self.attention_model = self.build_attention_model()
-        self.impact_predictor = self.build_impact_predictor()
-        self.sector_analyzer = self.build_sector_analyzer()
+        self.fuzzy_projector = self.build_fuzzy_projector()
+        self.cefset_attention = self.build_cefset_attention()
+        self.capitalization_predictor = self.build_capitalization_predictor()
+        self.reconstruction_decoder = self.build_reconstruction_decoder()
         
-        # Adattároló struktúrák
-        self.company_news_factors = {sym: [] for sym in self.symbols}
-        self.reliability_scores = {sym: 0.5 for sym in self.symbols}
-        self.market_correlations = self.initialize_market_correlations()
+        # Történelmi kapitalizációs arányok
+        self.historical_ratios = self.initialize_capitalization_ratios()
         
-        # Fuzzy rendszer komponensek (ha skicit-fuzzy használni akarjuk)
-        self.fuzzy_weights = {
-            'reliability': 0.3,
-            'temporal': 0.2,
-            'sector_impact': 0.25,
-            'market_sentiment': 0.25
-        }
+        # Cefset faktortár
+        self.cefset_factors = {symbol: [] for symbol in self.symbols}
         
-    def initialize_market_correlations(self) -> Dict:
-        """Piaci korrelációs mátrix inicializálása"""
-        correlations = {}
-        for sym1 in self.symbols:
-            correlations[sym1] = {}
-            for sym2 in self.symbols:
-                if sym1 == sym2:
-                    correlations[sym1][sym2] = 1.0
-                else:
-                    # Szimulált korrelációk szektorok alapján
-                    sector1 = self.sector_mapping[sym1]
-                    sector2 = self.sector_mapping[sym2]
-                    if sector1 == sector2:
-                        correlations[sym1][sym2] = np.random.uniform(0.6, 0.9)
-                    elif sector1.startswith('tech') and sector2.startswith('tech'):
-                        correlations[sym1][sym2] = np.random.uniform(0.3, 0.6)
-                    else:
-                        correlations[sym1][sym2] = np.random.uniform(0.1, 0.4)
-        return correlations
+    def initialize_cefsets(self) -> Dict[str, CefsetEntity]:
+        """Cefset entitások inicializálása"""
+        cefsets = {}
+        
+        for symbol in self.symbols:
+            # Alapvető fuzzy tagságok
+            fuzzy_membership = {}
+            for fuzzy_set, members in self.fuzzy_sets.items():
+                fuzzy_membership[fuzzy_set] = members.get(symbol, 0.0)
+            
+            # M2 supply csak FED-nél
+            m2_supply = self.base_market_caps[symbol] if symbol == 'FED' else None
+            
+            cefset = CefsetEntity(
+                symbol=symbol,
+                market_cap=self.base_market_caps[symbol],
+                sector=self.sector_mapping[symbol],
+                embedding=np.random.rand(self.company_dim),
+                fuzzy_membership=fuzzy_membership,
+                m2_supply=m2_supply
+            )
+            
+            cefsets[symbol] = cefset
+            
+        return cefsets
     
-    def build_news_encoder(self) -> Model:
-        """Hír encoder felépítése"""
-        input_layer = Input(shape=(self.embedding_dim,), name="news_embedding")
+    def initialize_capitalization_ratios(self) -> Dict[str, Dict[str, float]]:
+        """Kapitalizációs arányok inicializálása"""
+        total_market_cap = sum(self.base_market_caps.values())
+        
+        ratios = {}
+        for symbol1 in self.symbols:
+            ratios[symbol1] = {}
+            for symbol2 in self.symbols:
+                if symbol1 == symbol2:
+                    ratios[symbol1][symbol2] = 1.0
+                else:
+                    # Relatív kapitalizációs arány
+                    ratio = self.base_market_caps[symbol1] / self.base_market_caps[symbol2]
+                    ratios[symbol1][symbol2] = ratio
+                    
+        return ratios
+    
+    def build_keyword_encoder(self) -> Model:
+        """Kulcsszó mintázat encoder"""
+        input_layer = Input(shape=(len(self.keyword_categories),), name="keyword_pattern")
         x = BatchNormalization()(input_layer)
-        x = Dense(512, activation='relu')(x)
+        x = Dense(128, activation='relu')(x)
         x = Dropout(0.2)(x)
-        x = Dense(256, activation='relu')(x)
-        x = Dropout(0.2)(x)
-        x = Dense(self.latent_dim, activation='relu', name='news_latent')(x)
-        return Model(inputs=input_layer, outputs=x, name="NewsEncoder")
+        x = Dense(64, activation='relu')(x)
+        keyword_latent = Dense(self.latent_dim, activation='relu', name='keyword_latent')(x)
+        
+        return Model(inputs=input_layer, outputs=keyword_latent, name="KeywordEncoder")
     
     def build_company_encoder(self) -> Model:
-        """Cég encoder felépítése"""
-        input_layer = Input(shape=(self.company_dim,), name="company_features")
+        """Cég profil encoder"""
+        input_layer = Input(shape=(self.company_dim,), name="company_profile")
         x = BatchNormalization()(input_layer)
         x = Dense(256, activation='relu')(x)
         x = Dropout(0.2)(x)
         x = Dense(128, activation='relu')(x)
-        x = Dense(self.latent_dim, activation='relu', name='company_latent')(x)
-        return Model(inputs=input_layer, outputs=x, name="CompanyEncoder")
+        company_latent = Dense(self.latent_dim, activation='relu', name='company_latent')(x)
+        
+        return Model(inputs=input_layer, outputs=company_latent, name="CompanyEncoder")
     
-    def build_attention_model(self) -> Model:
-        """Attention-alapú hír-cég kapcsolat modell"""
-        news_input = Input(shape=(self.latent_dim,), name='news_latent_input')
-        company_input = Input(shape=(self.latent_dim,), name='company_latent_input')
+    def build_fuzzy_projector(self) -> Model:
+        """Fuzzy halmaz projektor - cégprofilból fuzzy tagságokba"""
+        company_input = Input(shape=(self.latent_dim,), name='company_latent')
         
-        # Kiterjesztés batch dimenzióra az attention-höz
-        news_exp = layers.Reshape((1, self.latent_dim))(news_input)
-        company_exp = layers.Reshape((1, self.latent_dim))(company_input)
-        
-        # Multi-head attention
-        attn_layer = Attention(use_scale=True)([news_exp, company_exp])
-        
-        # Kombinálás
-        combined = Concatenate(axis=-1)([news_exp, attn_layer])
-        flatten = layers.Flatten()(combined)
-        
-        x = Dense(128, activation='relu')(flatten)
+        x = Dense(64, activation='relu')(company_input)
         x = Dropout(0.3)(x)
-        x = Dense(64, activation='relu')(x)
-        attention_output = Dense(32, activation='relu', name='attention_features')(x)
+        x = Dense(32, activation='relu')(x)
         
-        return Model(inputs=[news_input, company_input], outputs=attention_output, name="AttentionModel")
+        # Minden fuzzy halmazra tagságot becsülünk
+        fuzzy_outputs = []
+        for fuzzy_set in self.fuzzy_sets.keys():
+            membership = Dense(1, activation='sigmoid', name=f'fuzzy_{fuzzy_set}')(x)
+            fuzzy_outputs.append(membership)
+        
+        fuzzy_vector = Concatenate(name='fuzzy_memberships')(fuzzy_outputs)
+        
+        return Model(inputs=company_input, outputs=fuzzy_vector, name="FuzzyProjector")
     
-    def build_impact_predictor(self) -> Model:
-        """Többdimenziós hatásvektor előrejelző"""
-        attention_input = Input(shape=(32,), name='attention_features')
+    def build_cefset_attention(self) -> Model:
+        """Cefset közötti attention mechanizmus"""
+        keyword_input = Input(shape=(self.latent_dim,), name='keyword_latent')
+        cefset_input = Input(shape=(len(self.symbols), self.latent_dim), name='all_cefsets')
         
-        # Főbb hatáskomponensek előrejelzése
-        x = Dense(64, activation='relu')(attention_input)
+        # Kulcsszó query-ként
+        keyword_query = layers.Reshape((1, self.latent_dim))(keyword_input)
+        
+        # Multi-head attention a cefset-ek között
+        attention_output = Attention(use_scale=True)([keyword_query, cefset_input, cefset_input])
+        
+        # Flatten és további feldolgozás
+        flattened = layers.Flatten()(attention_output)
+        x = Dense(128, activation='relu')(flattened)
         x = Dropout(0.2)(x)
-        x = Dense(32, activation='relu')(x)
+        cefset_context = Dense(64, activation='relu', name='cefset_context')(x)
         
-        # Hatásvektor komponensek:
-        # [0]: Direkt árfolyamhatás (-1 to 1)
-        # [1]: Volatilitás változás (0 to 1) 
-        # [2]: Szektoriális spillover (-1 to 1)
-        # [3]: Piaci sentiment hatás (-1 to 1)
-        # [4]: Időbeli persistencia (0 to 1)
-        # [5]: Likviditási hatás (-1 to 1)
-        # [6]: Relatív teljesítmény vs market (-1 to 1)
-        # [7]: Kockázati prémium változás (-1 to 1)
-        
-        price_impact = Dense(1, activation='tanh', name='price_impact')(x)
-        volatility_impact = Dense(1, activation='sigmoid', name='volatility_impact')(x)
-        sector_spillover = Dense(1, activation='tanh', name='sector_spillover')(x)
-        sentiment_impact = Dense(1, activation='tanh', name='sentiment_impact')(x)
-        temporal_persistence = Dense(1, activation='sigmoid', name='temporal_persistence')(x)
-        liquidity_impact = Dense(1, activation='tanh', name='liquidity_impact')(x)
-        relative_performance = Dense(1, activation='tanh', name='relative_performance')(x)
-        risk_premium = Dense(1, activation='tanh', name='risk_premium')(x)
-        
-        impact_vector = Concatenate(name='impact_vector')([
-            price_impact, volatility_impact, sector_spillover, sentiment_impact,
-            temporal_persistence, liquidity_impact, relative_performance, risk_premium
-        ])
-        
-        return Model(inputs=attention_input, outputs=impact_vector, name="ImpactPredictor")
+        return Model(inputs=[keyword_input, cefset_input], outputs=cefset_context, name="CefsetAttention")
     
-    def build_sector_analyzer(self) -> Model:
-        """Szektoriális hatás elemző"""
-        sector_input = Input(shape=(len(self.symbols),), name='sector_correlations')
-        impact_input = Input(shape=(self.impact_vector_dim,), name='base_impact')
+    def build_capitalization_predictor(self) -> Model:
+        """Kapitalizációs arányváltozás előrejelző"""
+        context_input = Input(shape=(64,), name='cefset_context')
         
-        x = Dense(32, activation='relu')(sector_input)
-        sector_features = Dense(16, activation='relu')(x)
+        x = Dense(128, activation='relu')(context_input)
+        x = Dropout(0.2)(x)
+        x = Dense(64, activation='relu')(x)
         
-        combined = Concatenate()([impact_input, sector_features])
-        x = Dense(64, activation='relu')(combined)
-        x = Dense(32, activation='relu')(x)
+        # Minden cefset párra kapitalizációs arányváltozást jósolunk
+        # Ez egy NxN mátrix lesz, ahol N = len(symbols)
+        n_symbols = len(self.symbols)
         
-        # Relatív piaci eltolódások minden cégre
-        market_shifts = Dense(len(self.symbols), activation='tanh', name='market_shifts')(x)
+        # Egyszerűsítés: minden symbol-ra relatív változást jósolunk
+        ratio_changes = []
+        for symbol in self.symbols:
+            change = Dense(1, activation='tanh', name=f'ratio_change_{symbol}')(x)
+            ratio_changes.append(change)
         
-        return Model(inputs=[sector_input, impact_input], outputs=market_shifts, name="SectorAnalyzer")
+        ratio_vector = Concatenate(name='capitalization_changes')(ratio_changes)
+        
+        return Model(inputs=context_input, outputs=ratio_vector, name="CapitalizationPredictor")
+    
+    def build_reconstruction_decoder(self) -> Model:
+        """Rekonstrukciós decoder - ellenőrzi a tanulást"""
+        combined_input = Input(shape=(64 + len(self.symbols),), name='combined_features')
+        
+        x = Dense(128, activation='relu')(combined_input)
+        x = Dropout(0.2)(x)
+        x = Dense(64, activation='relu')(x)
+        
+        # Eredeti kulcsszó mintázat rekonstrukciója
+        keyword_reconstruction = Dense(
+            len(self.keyword_categories), 
+            activation='sigmoid', 
+            name='keyword_reconstruction'
+        )(x)
+        
+        # Cég fuzzy tagság rekonstrukciója
+        fuzzy_reconstruction = Dense(
+            len(self.fuzzy_sets), 
+            activation='sigmoid', 
+            name='fuzzy_reconstruction'
+        )(x)
+        
+        return Model(
+            inputs=combined_input, 
+            outputs=[keyword_reconstruction, fuzzy_reconstruction], 
+            name="ReconstructionDecoder"
+        )
     
     def compile_models(self):
         """Modellek kompilálása"""
-        self.impact_predictor.compile(
+        self.capitalization_predictor.compile(
             optimizer=Adam(learning_rate=0.001),
             loss='mse',
             metrics=['mae']
         )
         
-        self.sector_analyzer.compile(
+        self.reconstruction_decoder.compile(
             optimizer=Adam(learning_rate=0.001),
-            loss='mse',
+            loss=['mse', 'mse'],
+            loss_weights=[0.5, 0.5],
             metrics=['mae']
         )
         
         logger.info("Modellek kompilálva")
     
-    def encode_news(self, news_emb: np.ndarray) -> np.ndarray:
-        """Hír enkódolása"""
-        if news_emb.ndim == 1:
-            news_emb = news_emb.reshape(1, -1)
-        return self.news_encoder.predict(news_emb, verbose=0)
+    def extract_keyword_pattern(self, news_text: str = None, 
+                              news_embedding: np.ndarray = None) -> np.ndarray:
+        """Kulcsszó mintázat kinyerése hírből"""
+        # Szimulált implementáció - valós esetben NLP feldolgozás
+        if news_embedding is not None:
+            # Embedding alapú pattern extraction
+            pattern = np.random.rand(len(self.keyword_categories))
+        else:
+            # Text alapú (dummy implementation)
+            pattern = np.random.rand(len(self.keyword_categories))
+        
+        # Normalize
+        return pattern / np.sum(pattern)
     
-    def encode_company(self, symbol: str) -> np.ndarray:
-        """Cég enkódolása"""
-        profile = self.company_profiles[symbol]
-        return self.company_encoder.predict(profile.reshape(1, -1), verbose=0)
+    def get_all_cefset_embeddings(self) -> np.ndarray:
+        """Összes cefset embedding mátrix"""
+        embeddings = []
+        for symbol in self.symbols:
+            company_latent = self.company_encoder.predict(
+                self.cefsets[symbol].embedding.reshape(1, -1), 
+                verbose=0
+            )
+            embeddings.append(company_latent.flatten())
+        
+        return np.array(embeddings).reshape(1, len(self.symbols), self.latent_dim)
     
-    def calculate_impact_vector(self, news_emb: np.ndarray, symbol: str) -> np.ndarray:
+    def analyze_news_cefset_impact(self, news_text: str = None, 
+                                 news_embedding: np.ndarray = None) -> Dict:
         """
-        Hír-cég pár hatásvektorának kiszámítása
-        
-        Returns:
-            8-dimenziós hatásvektor [price, volatility, sector, sentiment, 
-                                   persistence, liquidity, relative, risk]
-        """
-        # Enkódolás
-        news_latent = self.encode_news(news_emb)
-        company_latent = self.encode_company(symbol)
-        
-        # Attention features
-        attention_features = self.attention_model.predict(
-            [news_latent, company_latent], verbose=0
-        )
-        
-        # Alapvető hatásvektor
-        impact_vector = self.impact_predictor.predict(attention_features, verbose=0)
-        
-        return impact_vector.flatten()
-    
-    def calculate_market_shifts(self, base_impact: np.ndarray, target_symbol: str) -> Dict[str, float]:
-        """
-        Relatív piaci eltolódások kiszámítása egy cég hatása alapján
-        
-        Args:
-            base_impact: Alapvető hatásvektor
-            target_symbol: Célcég szimbóluma
-            
-        Returns:
-            Dict minden céggel és relatív eltolódásukkal
-        """
-        # Korrelációs vektor készítése
-        correlations = np.array([
-            self.market_correlations[target_symbol][sym] for sym in self.symbols
-        ])
-        
-        # Piaci eltolódások számítása
-        market_shifts = self.sector_analyzer.predict(
-            [correlations.reshape(1, -1), base_impact.reshape(1, -1)], verbose=0
-        )
-        
-        return {
-            symbol: float(shift) for symbol, shift in 
-            zip(self.symbols, market_shifts.flatten())
-        }
-    
-    def analyze_news_comprehensive(self, news_emb: np.ndarray, 
-                                 mentioned_companies: Optional[List[str]] = None) -> Dict:
-        """
-        Komprehenzív hírelemzés minden releváns cégre
-        
-        Args:
-            news_emb: Hír embedding
-            mentioned_companies: Explicitly mentioned companies (if any)
-            
-        Returns:
-            Teljes elemzési eredmény dict
+        Komprehenzív cefset hatáselemzés
         """
         results = {
             'timestamp': datetime.now(),
-            'direct_impacts': {},
-            'market_effects': {},
-            'sector_analysis': {},
+            'keyword_pattern': {},
+            'cefset_impacts': {},
+            'capitalization_changes': {},
+            'fuzzy_set_effects': {},
+            'reconstruction_quality': {},
             'summary': {}
         }
         
-        # Ha nincsenek megadott cégek, minden céget elemzünk
-        if mentioned_companies is None:
-            companies_to_analyze = self.symbols
-        else:
-            companies_to_analyze = [c for c in mentioned_companies if c in self.symbols]
-            if not companies_to_analyze:
-                companies_to_analyze = self.symbols
+        # 1. Kulcsszó mintázat kinyerése
+        keyword_pattern = self.extract_keyword_pattern(news_text, news_embedding)
+        keyword_latent = self.keyword_encoder.predict(
+            keyword_pattern.reshape(1, -1), verbose=0
+        )
         
-        total_market_impact = np.zeros(len(self.symbols))
+        results['keyword_pattern'] = {
+            category: float(weight) 
+            for category, weight in zip(self.keyword_categories.keys(), keyword_pattern)
+        }
         
-        # Minden cégre számítjuk a direkt hatást
-        for symbol in companies_to_analyze:
-            # Direkt hatásvektor
-            impact_vector = self.calculate_impact_vector(news_emb, symbol)
+        # 2. Cefset embeddings
+        all_cefsets = self.get_all_cefset_embeddings()
+        
+        # 3. Cefset attention és kontextus
+        cefset_context = self.cefset_attention.predict(
+            [keyword_latent, all_cefsets], verbose=0
+        )
+        
+        # 4. Kapitalizációs változások előrejelzése
+        cap_changes = self.capitalization_predictor.predict(cefset_context, verbose=0)
+        
+        results['capitalization_changes'] = {
+            symbol: float(change) 
+            for symbol, change in zip(self.symbols, cap_changes.flatten())
+        }
+        
+        # 5. Fuzzy halmaz hatások számítása
+        fuzzy_effects = self.calculate_fuzzy_set_effects(
+            keyword_pattern, cap_changes.flatten()
+        )
+        results['fuzzy_set_effects'] = fuzzy_effects
+        
+        # 6. Rekonstrukciós minőség ellenőrzése
+        combined_features = np.concatenate([
+            cefset_context.flatten(), 
+            cap_changes.flatten()
+        ]).reshape(1, -1)
+        
+        keyword_recon, fuzzy_recon = self.reconstruction_decoder.predict(
+            combined_features, verbose=0
+        )
+        
+        # Rekonstrukciós hibák
+        keyword_error = np.mean(np.abs(keyword_pattern - keyword_recon.flatten()))
+        
+        # Fuzzy tagságok aktuális értékei
+        current_fuzzy = np.array([
+            list(self.cefsets[symbol].fuzzy_membership.values())[0:len(self.fuzzy_sets)]
+            for symbol in self.symbols
+        ]).mean(axis=0)
+        
+        fuzzy_error = np.mean(np.abs(current_fuzzy - fuzzy_recon.flatten()))
+        
+        results['reconstruction_quality'] = {
+            'keyword_reconstruction_error': float(keyword_error),
+            'fuzzy_reconstruction_error': float(fuzzy_error),
+            'overall_reconstruction_quality': float(1.0 - (keyword_error + fuzzy_error) / 2)
+        }
+        
+        # 7. Cefset-szintű hatások
+        for i, symbol in enumerate(self.symbols):
+            cefset = self.cefsets[symbol]
+            cap_change = cap_changes.flatten()[i]
             
-            # Piaci eltolódások
-            market_shifts = self.calculate_market_shifts(impact_vector, symbol)
+            # Új kapitalizációs arány számítása
+            new_market_cap = cefset.market_cap * (1 + cap_change)
             
-            results['direct_impacts'][symbol] = {
-                'price_impact': float(impact_vector[0]),
-                'volatility_impact': float(impact_vector[1]),
-                'sector_spillover': float(impact_vector[2]),
-                'sentiment_impact': float(impact_vector[3]),
-                'temporal_persistence': float(impact_vector[4]),
-                'liquidity_impact': float(impact_vector[5]),
-                'relative_performance': float(impact_vector[6]),
-                'risk_premium_change': float(impact_vector[7]),
-                'overall_magnitude': float(np.linalg.norm(impact_vector))
+            # Relatív hatások más cefset-ekre
+            relative_effects = {}
+            for j, other_symbol in enumerate(self.symbols):
+                if symbol != other_symbol:
+                    old_ratio = self.historical_ratios[symbol][other_symbol]
+                    new_ratio = new_market_cap / self.cefsets[other_symbol].market_cap
+                    ratio_change = (new_ratio - old_ratio) / old_ratio
+                    relative_effects[other_symbol] = float(ratio_change)
+            
+            results['cefset_impacts'][symbol] = {
+                'direct_cap_change': float(cap_change),
+                'new_market_cap': float(new_market_cap),
+                'relative_effects': relative_effects,
+                'sector': cefset.sector,
+                'fuzzy_exposure': {
+                    fs: cefset.fuzzy_membership.get(fs, 0.0) 
+                    for fs in self.fuzzy_sets.keys()
+                }
             }
-            
-            results['market_effects'][symbol] = market_shifts
-            
-            # Akkumuláljuk a teljes piaci hatást
-            shifts_array = np.array([market_shifts[sym] for sym in self.symbols])
-            total_market_impact += shifts_array * abs(impact_vector[0])  # súlyozás árhatással
         
-        # Szektoriális elemzés
-        sector_impacts = {}
-        for sector in set(self.sector_mapping.values()):
-            sector_companies = [s for s, sec in self.sector_mapping.items() if sec == sector]
-            sector_impact = np.mean([
-                results['direct_impacts'].get(sym, {}).get('overall_magnitude', 0)
-                for sym in sector_companies if sym in results['direct_impacts']
-            ])
-            sector_impacts[sector] = float(sector_impact)
+        # 8. Összefoglaló
+        max_cap_change = max(abs(c) for c in cap_changes.flatten())
+        most_affected = self.symbols[np.argmax(np.abs(cap_changes.flatten()))]
         
-        results['sector_analysis'] = sector_impacts
-        
-        # Összefoglaló
-        all_impacts = [
-            data['overall_magnitude'] 
-            for data in results['direct_impacts'].values()
-        ]
+        dominant_keyword = max(
+            results['keyword_pattern'].items(), 
+            key=lambda x: x[1]
+        )[0]
         
         results['summary'] = {
-            'total_companies_affected': len(results['direct_impacts']),
-            'max_impact_magnitude': float(max(all_impacts)) if all_impacts else 0.0,
-            'avg_impact_magnitude': float(np.mean(all_impacts)) if all_impacts else 0.0,
-            'market_wide_effect': float(np.linalg.norm(total_market_impact)),
-            'most_affected_company': max(
-                results['direct_impacts'].items(), 
-                key=lambda x: x[1]['overall_magnitude']
-            )[0] if results['direct_impacts'] else None,
-            'dominant_sector': max(
-                sector_impacts.items(), 
-                key=lambda x: x[1]
-            )[0] if sector_impacts else None
+            'max_capitalization_change': float(max_cap_change),
+            'most_affected_cefset': most_affected,
+            'dominant_keyword_category': dominant_keyword,
+            'total_market_disruption': float(np.sum(np.abs(cap_changes.flatten()))),
+            'reconstruction_quality': results['reconstruction_quality']['overall_reconstruction_quality'],
+            'fuzzy_sets_activated': len([
+                fs for fs, effect in fuzzy_effects.items() 
+                if effect['total_impact'] > 0.01
+            ])
         }
         
         return results
     
-    def update_company_factors(self, symbol: str, news_emb: np.ndarray, 
-                             impact_vector: np.ndarray):
-        """Cég hírfaktorainak frissítése"""
-        news_latent = self.encode_news(news_emb)
+    def calculate_fuzzy_set_effects(self, keyword_pattern: np.ndarray, 
+                                  cap_changes: np.ndarray) -> Dict:
+        """Fuzzy halmazok hatásainak számítása"""
+        fuzzy_effects = {}
         
-        factor_entry = {
-            'news_factor': news_latent.flatten(),
-            'impact_vector': impact_vector,
-            'timestamp': datetime.now(),
-            'reliability': self.reliability_scores.get(symbol, 0.5)
-        }
+        for fuzzy_set, members in self.fuzzy_sets.items():
+            total_impact = 0.0
+            weighted_change = 0.0
+            member_impacts = {}
+            
+            for symbol, membership in members.items():
+                if symbol in self.symbols:
+                    symbol_idx = self.symbols.index(symbol)
+                    cap_change = cap_changes[symbol_idx]
+                    
+                    # Membership-súlyozott hatás
+                    weighted_impact = membership * cap_change
+                    total_impact += abs(weighted_impact)
+                    weighted_change += weighted_impact
+                    
+                    member_impacts[symbol] = {
+                        'membership': float(membership),
+                        'cap_change': float(cap_change),
+                        'weighted_impact': float(weighted_impact)
+                    }
+            
+            fuzzy_effects[fuzzy_set] = {
+                'total_impact': float(total_impact),
+                'weighted_change': float(weighted_change),
+                'member_impacts': member_impacts,
+                'set_coherence': float(1.0 - np.std([
+                    m['cap_change'] for m in member_impacts.values()
+                ]) if member_impacts else 0.0)
+            }
         
-        self.company_news_factors[symbol].append(factor_entry)
-        
-        # Csak az utolsó 100 faktort tartjuk meg
-        if len(self.company_news_factors[symbol]) > 100:
-            self.company_news_factors[symbol] = self.company_news_factors[symbol][-100:]
+        return fuzzy_effects
     
-    def train_on_historical_data(self, news_embeddings: List[np.ndarray],
-                               company_symbols: List[str],
-                               impact_labels: List[np.ndarray],
-                               epochs: int = 10):
+    def update_cefset_factors(self, analysis_result: Dict):
+        """Cefset faktorok frissítése elemzés alapján"""
+        for symbol in self.symbols:
+            if symbol in analysis_result['cefset_impacts']:
+                impact_data = analysis_result['cefset_impacts'][symbol]
+                
+                factor_entry = {
+                    'keyword_pattern': analysis_result['keyword_pattern'],
+                    'cap_change': impact_data['direct_cap_change'],
+                    'relative_effects': impact_data['relative_effects'],
+                    'fuzzy_exposure': impact_data['fuzzy_exposure'],
+                    'timestamp': analysis_result['timestamp'],
+                    'reconstruction_quality': analysis_result['reconstruction_quality']['overall_reconstruction_quality']
+                }
+                
+                self.cefset_factors[symbol].append(factor_entry)
+                
+                # Történelmi limitálás
+                if len(self.cefset_factors[symbol]) > 200:
+                    self.cefset_factors[symbol] = self.cefset_factors[symbol][-200:]
+    
+    def train_on_historical_data(self, historical_data: List[Dict], epochs: int = 10):
         """
-        Modell tanítása történelmi adatokon
+        Történelmi adatokon tanítás
         
         Args:
-            news_embeddings: Lista hír embeddingekről
-            company_symbols: Lista cég szimbólumokról
-            impact_labels: Lista valós hatásvektorokról
+            historical_data: Lista dict-ekről, mindegyik tartalmaz:
+                - keyword_pattern: kulcsszó mintázat
+                - capitalization_changes: valós kapitalizációs változások
+                - cefset_states: cefset állapotok
         """
-        X_news, X_company, X_attention, y = [], [], [], []
+        if not historical_data:
+            logger.warning("Nincs történelmi adat a tanításhoz")
+            return
         
-        for news_emb, symbol, impact_label in zip(news_embeddings, company_symbols, impact_labels):
-            if symbol not in self.symbols:
-                continue
-                
-            news_latent = self.encode_news(news_emb)
-            company_latent = self.encode_company(symbol)
+        X_context, y_cap_changes = [], []
+        X_recon, y_keywords, y_fuzzy = [], [], []
+        
+        for data_point in historical_data:
+            keyword_pattern = np.array(list(data_point['keyword_pattern'].values()))
+            cap_changes = np.array(list(data_point['capitalization_changes'].values()))
             
-            attention_features = self.attention_model.predict(
-                [news_latent, company_latent], verbose=0
+            # Kontextus generálása
+            keyword_latent = self.keyword_encoder.predict(
+                keyword_pattern.reshape(1, -1), verbose=0
+            )
+            all_cefsets = self.get_all_cefset_embeddings()
+            cefset_context = self.cefset_attention.predict(
+                [keyword_latent, all_cefsets], verbose=0
             )
             
-            X_attention.append(attention_features.flatten())
-            y.append(impact_label)
-        
-        if X_attention and y:
-            X_attention = np.array(X_attention)
-            y = np.array(y)
+            X_context.append(cefset_context.flatten())
+            y_cap_changes.append(cap_changes)
             
-            # Impact predictor tanítása
-            self.impact_predictor.fit(
-                X_attention, y, 
-                epochs=epochs, 
-                batch_size=32, 
-                validation_split=0.2,
-                verbose=1
+            # Rekonstrukciós adatok
+            combined_features = np.concatenate([
+                cefset_context.flatten(), cap_changes
+            ])
+            X_recon.append(combined_features)
+            y_keywords.append(keyword_pattern)
+            
+            # Fuzzy states generálása (egyszerűsített)
+            fuzzy_state = np.random.rand(len(self.fuzzy_sets))
+            y_fuzzy.append(fuzzy_state)
+        
+        if X_context and X_recon:
+            X_context = np.array(X_context)
+            y_cap_changes = np.array(y_cap_changes)
+            X_recon = np.array(X_recon)
+            y_keywords = np.array(y_keywords)
+            y_fuzzy = np.array(y_fuzzy)
+            
+            # Kapitalizációs előrejelző tanítása
+            logger.info("Kapitalizációs előrejelző tanítása...")
+            self.capitalization_predictor.fit(
+                X_context, y_cap_changes,
+                epochs=epochs, batch_size=16, validation_split=0.2, verbose=1
             )
             
-            logger.info(f"Modell tanítva {len(y)} mintán")
-    
-    def get_company_summary(self, symbol: str) -> Dict:
-        """Cég összefoglaló információi"""
-        factors = self.company_news_factors.get(symbol, [])
+            # Rekonstrukciós decoder tanítása
+            logger.info("Rekonstrukciós decoder tanítása...")
+            self.reconstruction_decoder.fit(
+                X_recon, [y_keywords, y_fuzzy],
+                epochs=epochs, batch_size=16, validation_split=0.2, verbose=1
+            )
+            
+            logger.info(f"Tanítás befejezve {len(historical_data)} mintán")
         
-        if not factors:
-            return {'symbol': symbol, 'total_factors': 0}
-        
-        recent_factors = [
-            f for f in factors 
-            if (datetime.now() - f['timestamp']).days <= 7
-        ]
-        
-        avg_impact = np.mean([
-            np.linalg.norm(f['impact_vector']) for f in recent_factors
-        ]) if recent_factors else 0.0
-        
-        return {
-            'symbol': symbol,
-            'total_factors': len(factors),
-            'recent_factors_7d': len(recent_factors),
-            'avg_recent_impact': float(avg_impact),
-            'reliability_score': self.reliability_scores.get(symbol, 0.5),
-            'sector': self.sector_mapping.get(symbol, 'unknown'),
-            'last_update': factors[-1]['timestamp'] if factors else None
+    def get_cefset_summary(self) -> Dict:
+        """Cefset rendszer összefoglalója"""
+        summary = {
+            'total_cefsets': len(self.symbols),
+            'total_market_cap': sum(cefset.market_cap for cefset in self.cefsets.values()),
+            'fuzzy_sets': len(self.fuzzy_sets),
+            'keyword_categories': len(self.keyword_categories),
+            'cefset_details': {},
+            'fuzzy_set_stats': {},
+            'recent_activity': {}
         }
+        
+        # Cefset részletek
+        for symbol, cefset in self.cefsets.items():
+            summary['cefset_details'][symbol] = {
+                'market_cap': cefset.market_cap,
+                'sector': cefset.sector,
+                'fuzzy_memberships': cefset.fuzzy_membership,
+                'recent_factors': len(self.cefset_factors.get(symbol, [])),
+                'is_fed': symbol == 'FED',
+                'm2_supply': cefset.m2_supply
+            }
+        
+        # Fuzzy halmaz statisztikák
+        for fuzzy_set, members in self.fuzzy_sets.items():
+            total_cap = sum(
+                self.cefsets[symbol].market_cap * membership
+                for symbol, membership in members.items()
+                if symbol in self.cefsets
+            )
+            
+            summary['fuzzy_set_stats'][fuzzy_set] = {
+                'member_count': len(members),
+                'total_weighted_cap': total_cap,
+                'avg_membership': np.mean(list(members.values())),
+                'members': members
+            }
+        
+        return summary
 
 
-def demo_usage():
-    """Demonstrációs használat"""
-    print("=== Integrált Hírfaktor Elemző Rendszer Demo ===\n")
+def demo_cefset_usage():
+    """Cefset rendszer demonstrációs használat"""
+    print("=== Cefset-alapú Hírelemző Rendszer Demo ===\n")
     
     # Rendszer inicializálása
-    analyzer = IntegratedNewsAnalyzer()
+    analyzer = CefsetNewsAnalyzer()
     analyzer.compile_models()
     
-    # Szimulált hírek (pl. BERT embeddings)
-    dummy_news = [
-        np.random.rand(768),  # Apple bevétel hír
-        np.random.rand(768),  # Microsoft cloud hír  
-        np.random.rand(768),  # Tech szektor hír
-        np.random.rand(768),  # Piaci volatilitási hír
+    print("1. Cefset rendszer áttekintése:\n")
+    summary = analyzer.get_cefset_summary()
+    print(f"Összesen {summary['total_cefsets']} cefset")
+    print(f"Teljes piaci kapitalizáció: ${summary['total_market_cap']:.1f}B")
+    print(f"Fuzzy halmazok száma: {summary['fuzzy_sets']}")
+    
+    print("\nFuzzy halmazok:")
+    for fuzzy_set, stats in summary['fuzzy_set_stats'].items():
+        print(f"  {fuzzy_set}: {stats['member_count']} tag, "
+              f"${stats['total_weighted_cap']:.1f}B súlyozott kapitalizáció")
+    
+    print("\n" + "="*60 + "\n")
+    
+    print("2. Hírek cefset hatáselemzése:\n")
+    
+    # Szimulált hírek
+    test_news = [
+        "Federal Reserve raises interest rates by 0.25% to combat inflation",
+        "Apple reports record quarterly earnings beating analyst expectations", 
+        "Tesla announces new gigafactory expansion in Texas",
+        "AI chip demand surges as tech companies increase spending"
     ]
     
-    print("1. Hírek elemzése:\n")
-    
-    # Minden hírre komprehenzív elemzés
-    for i, news_emb in enumerate(dummy_news):
-        print(f"--- Hír #{i+1} Elemzése ---")
+    for i, news in enumerate(test_news):
+        print(f"--- Hír #{i+1}: {news[:50]}... ---")
         
-        # Komprehenzív elemzés
-        analysis = analyzer.analyze_news_comprehensive(
-            news_emb, 
-            mentioned_companies=['AAPL', 'MSFT'] if i < 2 else None
-        )
+        # Cefset hatáselemzés
+        analysis = analyzer.analyze_news_cefset_impact(news_text=news)
         
-        # Eredmények kiírása
-        print(f"Érintett cégek száma: {analysis['summary']['total_companies_affected']}")
-        print(f"Max hatás nagysága: {analysis['summary']['max_impact_magnitude']:.4f}")
-        print(f"Piaci szintű hatás: {analysis['summary']['market_wide_effect']:.4f}")
-        print(f"Leginkább érintett cég: {analysis['summary']['most_affected_company']}")
-        print(f"Domináns szektor: {analysis['summary']['dominant_sector']}")
-        
-        # Top 3 direkt hatás
-        sorted_impacts = sorted(
-            analysis['direct_impacts'].items(),
-            key=lambda x: x[1]['overall_magnitude'],
-            reverse=True
-        )[:3]
-        
-        print("\nTop 3 Direkt Hatás:")
-        for symbol, impact_data in sorted_impacts:
-            print(f"  {symbol}: {impact_data['overall_magnitude']:.4f} "
-                  f"(ár: {impact_data['price_impact']:.3f}, "
-                  f"volatilitás: {impact_data['volatility_impact']:.3f})")
-        
-        # Faktorok frissítése
-        for symbol in analysis['direct_impacts']:
-            impact_vector = np.array([
-                analysis['direct_impacts'][symbol]['price_impact'],
-                analysis['direct_impacts'][symbol]['volatility_impact'],
-                analysis['direct_impacts'][symbol]['sector_spillover'],
-                analysis['direct_impacts'][symbol]['sentiment_impact'],
-                analysis['direct_impacts'][symbol]['temporal_persistence'],
-                analysis['direct_impacts'][symbol]['liquidity_impact'],
-                analysis['direct_impacts'][symbol]['relative_performance'],
-                analysis['direct_impacts'][symbol]['risk_premium_change']
-            ])
-            analyzer.update_company_factors(symbol, news_emb, impact_vector)
-        
-        print("\n" + "="*50 + "\n")
-    
-    print("2. Cégek összefoglalója:\n")
-    
-    # Cégek jelenlegi állapota
-    for symbol in analyzer.symbols:
-        summary = analyzer.get_company_summary(symbol)
-        print(f"{symbol}: {summary['total_factors']} faktor, "
-              f"átlag hatás: {summary['avg_recent_impact']:.4f}, "
-              f"megbízhatóság: {summary['reliability_score']:.3f}")
-    
-    print(f"\n3. Szimulált tanítás történelmi adatokon...")
-    
-    # Szimulált történelmi adatok
-    historical_news = [np.random.rand(768) for _ in range(50)]
-    historical_symbols = [random.choice(analyzer.symbols) for _ in range(50)]
-    historical_impacts = [np.random.rand(8) * 0.5 - 0.25 for _ in range(50)]  # -0.25 to 0.25
-    
-    analyzer.train_on_historical_data(
-        historical_news, 
-        historical_symbols, 
-        historical_impacts,
-        epochs=3
-    )
-    
-    print("Demo befejezve!")
-
-if __name__ == "__main__":
-    demo_usage()
+        print(f"Domináns kulcsszó
