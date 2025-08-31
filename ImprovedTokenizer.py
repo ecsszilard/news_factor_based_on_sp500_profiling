@@ -99,21 +99,21 @@ class ImprovedTokenizer:
         
         tokens = []
         if add_special_tokens:
-            tokens.append(self.tokenizer.word_to_idx['[CLS]'])
+            tokens.append(self.word_to_idx['[CLS]'])
         
         for word in words:
-            if word in self.tokenizer.word_to_idx:
-                tokens.append(self.tokenizer.word_to_idx[word])
+            if word in self.word_to_idx:
+                tokens.append(self.word_to_idx[word])
             else:
-                tokens.append(self.tokenizer.word_to_idx['[UNK]'])
+                tokens.append(self.word_to_idx['[UNK]'])
         
         if add_special_tokens:
-            tokens.append(self.tokenizer.word_to_idx['[SEP]'])
+            tokens.append(self.word_to_idx['[SEP]'])
         
         # Padding vagy truncation
         if len(tokens) > max_length:
             tokens = tokens[:max_length]
         else:
-            tokens.extend([self.tokenizer.word_to_idx['[PAD]']] * (max_length - len(tokens)))
+            tokens.extend([self.word_to_idx['[PAD]']] * (max_length - len(tokens)))
         
         return np.array(tokens)

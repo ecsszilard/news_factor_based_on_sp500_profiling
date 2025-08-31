@@ -1,23 +1,12 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.layers import (Input, Dense, Embedding, Attention, Dropout, 
-                                   LayerNormalization, MultiHeadAttention, Reshape, 
-                                   Flatten, Concatenate, BatchNormalization, Add)
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
 from transformers import AutoTokenizer, AutoModel
 import torch
-import datetime
-import time
 import logging
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-import json
-import pickle
-import os
-from collections import defaultdict
-import re
+
 
 logger = logging.getLogger("AdvancedNewsFactor.CompanyEmbeddingSystem")
 

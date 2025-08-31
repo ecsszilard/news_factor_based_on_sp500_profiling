@@ -58,25 +58,20 @@ class AdvancedTradingSystem:
             company_embedding = self.company_system.company_embeddings[company]
             
             # Kapitalizációs változás előrejelzése
-            prediction = self.news_model.predict_capitalization_change(
-                keyword_sequence, company_embedding
-            )
-            
-            # Attention súlyok a magyarázhatóságért
-            attention_info = self.news_model.get_attention_weights(
-                keyword_sequence, company_embedding
-            )
+            prediction_result = self.news_model.predict_capitalization_change(keyword_sequence, company_embedding, news_text=news_text, company_symbol=company, return_detailed=True)
             
             results[company] = {
                 'predicted_changes': {
-                    '1d': prediction[0],
-                    '5d': prediction[1],
-                    '20d': prediction[2],
-                    'volatility': prediction[3]
+                    '1d': prediction_result['capitalization_prediction'][0],
+                    '5d': prediction_result['capitalization_prediction'][1], 
+                    '20d': prediction_result['capitalization_prediction'][2],
+                    'volatility': prediction_result['capitalization_prediction'][3]
                 },
-                'attention_scores': attention_info['attention_scores'],
-                'decoded_keywords': attention_info['decoded_keywords'],
-                'confidence': np.abs(prediction).mean()  # Átlagos előrejelzési magabiztosság
+                'financial_attention_weights': prediction_result['learned_financial_attention'],
+                'input_financial_context': prediction_result['input_financial_weights'],
+                'decoded_keywords': prediction_result['attention_analysis']['decoded_keywords'],
+                'top_financial_keywords': prediction_result['attention_analysis']['top_financial_keywords'],
+                'confidence': prediction_result['attention_analysis']['confidence_score']
             }
         
         return results
