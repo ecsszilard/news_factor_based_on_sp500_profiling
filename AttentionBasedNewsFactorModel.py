@@ -7,270 +7,257 @@ import logging
 
 from BiDirectionalAttentionLayer import BiDirectionalAttentionLayer
 from ImprovedTokenizer import ImprovedTokenizer
+from FinancialImpactTracker import FinancialImpactTracker
 
 logger = logging.getLogger("AdvancedNewsFactor.AttentionBasedNewsFactorModel")
 
 class AttentionBasedNewsFactorModel:
-    """
-    Attention-alapú hírfaktor modell kapitalizációs változások előrejelzésére
-    """
-    
-    def __init__(self, vocab_size=50000, keyword_dim=256, company_dim=512, 
-                 latent_dim=128, max_keywords=100):
-        """
-        Inicializálja az attention-alapú modellt
-        
-        Paraméterek:
-            vocab_size (int): Szótár mérete
-            keyword_dim (int): Kulcsszó beágyazási dimenzió
-            company_dim (int): Cég beágyazási dimenzió
-            latent_dim (int): Látens reprezentáció dimenzió
-            max_keywords (int): Maximum kulcsszavak száma
-        """
+    """Multi-task learning model for news sentiment analysis with shared company embeddings"""
+
+    def __init__(self, company_system, vocab_size=50000, keyword_dim=256, company_dim=256, latent_dim=128, max_keywords=100):
+        self.company_system = company_system
         self.vocab_size = vocab_size
         self.keyword_dim = keyword_dim
         self.company_dim = company_dim
         self.latent_dim = latent_dim
         self.max_keywords = max_keywords
         
-        # Szótár és tokenizer
         self.tokenizer = ImprovedTokenizer(vocab_size)
-        
-        # Financial impact tracker inicializálása
-        self.financial_tracker = FinancialImpactTracker()
-        
-        # Modell építése
         self.model = self.build_model()
-        logger.info("Neural network architektúra felépítve")
-
-        # Modell összeállítása multi-task loss-szal
+        
+        # Multi-task loss weights
         self.model.compile(
             optimizer=Adam(learning_rate=0.001),
             loss={
-                'capitalization_prediction': 'mse',
-                'keyword_reconstruction': 'mse',
-                'financial_attention_loss': 'categorical_crossentropy'
+                'price_change_prediction': 'mse',
+                'volatility_prediction': 'mse',
+                'relevance_prediction': 'binary_crossentropy',
+                'news_reconstruction': 'mse',
+                'attention_regularization': 'categorical_crossentropy'  # Added back
             },
             loss_weights={
-                'capitalization_prediction': 1.0,
-                'keyword_reconstruction': 0.3,
-                'financial_attention_loss': 0.2
+                'price_change_prediction': 2.0,  # Main task
+                'volatility_prediction': 1.5,
+                'relevance_prediction': 1.0,
+                'news_reconstruction': 0.3,
+                'attention_regularization': 0.2  # Encourages meaningful attention patterns
             },
             metrics={
-                'capitalization_prediction': ['mae'],
-                'keyword_reconstruction': ['mae'],
-                'financial_attention_loss': ['accuracy']
+                'price_change_prediction': ['mae'],
+                'volatility_prediction': ['mae'],
+                'relevance_prediction': ['accuracy'],
+                'news_reconstruction': ['mae'],
+                'attention_regularization': ['accuracy']
             }
         )
-        
-        logger.info("AttentionBasedNewsFactorModel inicializálva")
 
     def build_model(self):
-        """
-        Felépíti a bi-directional attention architektúrát
-        """
-        # -----------------------------
-        # 1. Input rétegek
-        # -----------------------------
-        keyword_input = Input(shape=(self.max_keywords,), name='keywords')  # Kulcsszavak tokenizált szekvenciája, pl. (batch, max_keywords)
-        company_input = Input(shape=(self.company_dim,), name='company_embedding')  # Cég embedding (pl. fundamentális vagy piaci jellemzők alapján), (batch, company_dim)
-        financial_weights_input = Input(shape=(self.max_keywords,), name='financial_weights')
+        """Multi-task model with shared company embeddings.
+        Combines global context informativeness with local keyword relevance via attention and reconstruction."""
 
         # -----------------------------
-        # 2. Keyword Encoder
+        # 1. Inputs
+        # -----------------------------
+        keyword_input = Input(shape=(self.max_keywords,), name='keywords')
+        company_idx_input = Input(shape=(1,), name='company_idx', dtype='int32')
+
+        # -----------------------------
+        # 2. Keyword encoder (impact-aware)
         # -----------------------------
         keyword_embedding = Embedding(
             input_dim=self.vocab_size,
             output_dim=self.keyword_dim,
-            mask_zero=True
-        )(keyword_input)  # Kulcsszavak beágyazása, shape: (batch, max_keywords, keyword_dim)
+            mask_zero=True,
+            embeddings_regularizer=l1_l2(1e-5, 1e-4),
+            name='keyword_embeddings'
+        )(keyword_input) # These learn impact patterns
 
-        keyword_self_attention = MultiHeadAttention(
+        attn_keywords = MultiHeadAttention(
             num_heads=8,
             key_dim=self.keyword_dim // 8,
-            name='keyword_self_attention'
-        )(keyword_embedding, keyword_embedding)  # multi-head self-attention: hogyan kapcsolódnak egymáshoz a kulcsszavak
-        keyword_attention = LayerNormalization()(keyword_self_attention + keyword_embedding) # residual connection + LayerNorm
-        keyword_latent = Dense(self.latent_dim, activation='relu', name='keyword_latent_transform')(keyword_attention) # minden kulcsszóhoz megőrzünk egy latent reprezentációt
-        keyword_latent = Dropout(0.2)(keyword_latent)  # keyword_latent shape: (batch, max_keywords, latent_dim)
+            dropout=0.1,
+            name='keyword_attention'
+        )(keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
+
+        keyword_latent = Dense(
+            self.latent_dim,
+            activation='relu',
+            kernel_regularizer=l1_l2(1e-5, 1e-4),
+            name='keyword_transform'
+        )(LayerNormalization()(attn_keywords + keyword_embedding))
+        keyword_latent = Dropout(0.2)(keyword_latent)
+
+        keyword_impact = Dense(
+            self.latent_dim,
+            activation='tanh',
+            name='impact_regularization'
+        )(keyword_latent) # Encourages similar-impact keywords to cluster
 
         # -----------------------------
-        # 3. Company Embedding Processing
+        # 3. Company embedding
         # -----------------------------
-        company_processed = Dense(self.latent_dim, activation='relu', name='company_processed')(company_input)
-        company_processed = BatchNormalization()(company_processed)
-        company_reshaped = Reshape((1, self.latent_dim))(company_processed)  # company_reshaped shape: (batch, 1, latent_dim)
+        company_emb = Embedding(
+            input_dim=self.company_system.num_companies,
+            output_dim=self.company_dim,
+            name='company_embeddings'
+        )(company_idx_input)
+
+        company_proc = Dense(
+            self.latent_dim,
+            activation='relu',
+            kernel_regularizer=l1_l2(1e-5, 1e-4),
+            name='company_processed'
+        )(company_emb)
+        company_proc = BatchNormalization()(company_proc)
+        company_proc = Dropout(0.1)(company_proc)
+        company_reshaped = Reshape((1, self.latent_dim))(company_proc)
+
+        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein,
+        # ha többdimenziós cégháló-struktúrát (pl. szektor, beszállítói lánc) akarunk modellezni.
+        # Ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
 
         # -----------------------------
-        # 4. Bi-directional attention layer
+        # 4. Bi-directional attention
         # -----------------------------
-        bidirectional_attention = BiDirectionalAttentionLayer(
-            latent_dim=self.latent_dim,
+        comp_to_news = MultiHeadAttention(
             num_heads=4,
-            name='bidirectional_attention'
-        )
-        
-        attention_results = bidirectional_attention(
-            [company_reshaped, keyword_latent],
-            financial_weights=financial_weights_input
-        )
+            key_dim=self.latent_dim // 4,
+            name='company_to_news'
+        )(company_reshaped, keyword_impact, keyword_impact)
+
+        news_to_comp = MultiHeadAttention(
+            num_heads=4,
+            key_dim=self.latent_dim // 4,
+            name='news_to_company'
+        )(keyword_impact, company_reshaped, company_reshaped)
+
+        combined = Concatenate(axis=-1)([
+            comp_to_news,
+            tf.reduce_mean(news_to_comp, axis=1, keepdims=True)
+        ])
+
+        combined_norm = LayerNormalization()(Dense(
+            self.latent_dim,
+            activation='tanh',
+            name='attention_combination'
+        )(combined))
 
         # -----------------------------
-        # 5. Combination and feature Processing
+        # 5. Shared representation
         # -----------------------------
-        flattened_attention = Flatten()(attention_results['combined_output'])  # (batch, latent_dim)
-        combined_features = Concatenate()([flattened_attention, company_processed]) # egyesíti a cross-attention kimenetet és a feldolgozott cég embeddinget
+        combined_features = Concatenate()([
+            Flatten()(combined_norm),
+            Flatten()(company_proc),
+            GlobalAveragePooling1D()(keyword_impact)
+        ])
 
-        x = Dense(256, activation='relu')(combined_features)
+        x = Dense(256, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4))(combined_features)
         x = BatchNormalization()(x)
         x = Dropout(0.3)(x)
-        x = Dense(128, activation='relu')(x)
-        x = BatchNormalization()(x)
-        combined_representation = Dropout(0.2)(x)
-        
-        # -----------------------------
-        # 6. Capitalization Predictor
-        # -----------------------------
-        cap_prediction = Dense(64, activation='relu', name='cap_hidden')(combined_representation)
-        cap_prediction = Dropout(0.1)(cap_prediction)
-        capitalization_output = Dense(4, activation='linear', name='capitalization_prediction')(cap_prediction)
-        
-        # -----------------------------
-        # 7. Reconstruction Decoder
-        # -----------------------------
-        attention_pooled = self.attention_pooling_layer(attention_results['weighted_keywords'], company_reshaped) #  Attention-based pooling használata, a kulcsszó-attention súlyozott átlaga mint rekonstrukciós cél
-        reconstruction_hidden = Dense(128, activation='relu', name='reconstruction_hidden')(attention_pooled)
-        reconstruction_hidden = Dropout(0.2)(reconstruction_hidden)
-        reconstructed_keywords = Dense(self.latent_dim, activation='tanh',name='keyword_reconstruction')(reconstruction_hidden)
 
-        # Financial attention prediction
-        financial_attention_pred = Dense(64, activation='relu')(combined_representation)
-        financial_attention_pred = Dropout(0.1)(financial_attention_pred)
-        financial_attention_output = Dense(self.max_keywords, activation='softmax', name='financial_attention_loss')(financial_attention_pred)
-        
+        shared = Dense(128, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4), name='shared_rep')(x)
+        shared = BatchNormalization()(shared)
+        shared = Dropout(0.2)(shared)
+
         # -----------------------------
-        # 8. Teljes modell összeállítása
+        # 6. Prediction heads
         # -----------------------------
+        price = Dense(64, activation='relu')(shared)
+        price = Dropout(0.1)(price)
+        price_out = Dense(3, activation='linear', name='price_prediction')(price)
+
+        vol = Dense(64, activation='relu')(shared)
+        vol = Dropout(0.1)(vol)
+        vol_out = Dense(2, activation='linear', name='volatility_prediction')(vol)
+
+        rel = Dense(32, activation='relu')(shared)
+        rel = Dropout(0.1)(rel)
+        rel_out = Dense(1, activation='sigmoid', name='relevance_prediction')(rel)
+
+        recon_out = self._create_news_recon(keyword_latent, shared, company_emb)
+
+        attn_reg = Dense(64, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4))(shared)
+        attn_reg = Dropout(0.1)(attn_reg)
+        attn_reg_out = Dense(self.max_keywords, activation='softmax', name='attention_regularization')(attn_reg)
+
         return Model(
-            inputs=[keyword_input, company_input, financial_weights_input],
-            outputs=[capitalization_output, reconstructed_keywords, financial_attention_output],
-            name='BiDirectionalNewsFactorModel'
+            inputs=[keyword_input, company_idx_input],
+            outputs=[price_out, vol_out, rel_out, recon_out, attn_reg_out],
+            name='NewsFactorModel'
         )
 
-    def prepare_keyword_sequence(self, text, max_length=None):
-        """
-        Előkészíti a szöveget kulcsszó szekvenciává
+    def _create_news_recon(self, keyword_latent, shared, company_emb):
+        d = tf.shape(keyword_latent)[-1]
+        scale = tf.sqrt(tf.cast(d, tf.float32))
+
+        scores = tf.einsum('bcd,btd->bct', company_emb, keyword_latent) / scale
+        attn_weights = tf.nn.softmax(scores, axis=-1)
+        company_context = tf.einsum('bct,btd->bcd', attn_weights, keyword_latent)
+
+        comp_importance = Dense(1)(company_context)
+        comp_importance = tf.nn.softmax(tf.squeeze(comp_importance, -1), axis=-1)
+        comp_importance = tf.expand_dims(comp_importance, -1)
+        pooled_news = tf.reduce_sum(company_context * comp_importance, axis=1)
+
+        global_hidden = Dense(128, activation='relu')(shared)
+        recon_input = Concatenate(axis=-1)([global_hidden, pooled_news])
+        recon_input = Dropout(0.2)(recon_input)
+        return Dense(d, activation='tanh', name='news_reconstruction')(recon_input)
         
-        Paraméterek:
-            text (str): Bemeneti szöveg
-            max_length (int): Maximum hossz, alapértelmezett self.max_keywords
-            
-        Visszatérési érték:
-            numpy.ndarray: Tokenizált és padding-elt szekvencia
-        """
+        
+    def prepare_keyword_sequence(self, text, max_length=None):
         if max_length is None:
             max_length = self.max_keywords
         return self.tokenizer.encode(text, max_length=max_length)
         
-    def attention_pooling_layer(self, weighted_keywords, company_query):
-        """
-        Attention pooling company_query és weighted_keywords alapján
-        
-        Paraméterek:
-            weighted_keywords: (batch, max_keywords, latent_dim)
-            company_query: (batch, 1, latent_dim)
-        
-        Visszatérési érték:
-            Súlyozott keyword reprezentáció
-        """
-        
-        # Dot-product attention scores
-        scores = tf.reduce_sum(
-            weighted_keywords * company_query,  # Broadcasting: (batch, max_keywords, latent_dim)
-            axis=-1, keepdims=True  # (batch, max_keywords, 1)
-        )
-        
-        # Softmax normalizálás
-        attention_weights = tf.nn.softmax(scores, axis=1)  # (batch, max_keywords, 1)
-        
-        # Súlyozott összeg
-        pooled = tf.reduce_sum(
-            weighted_keywords * attention_weights,  # (batch, max_keywords, latent_dim)
-            axis=1  # (batch, latent_dim)
-        )
-        return pooled
-    
     def build_vocabulary(self, news_texts):
-        """
-        Szótár építése a hírekből
-        
-        Paraméterek:
-            news_texts (list): Hírek listája
-        """
-        logger.info("Szótár építése...")
         self.tokenizer.build_vocab(news_texts)
-        logger.info(f"Szótár mérete: {len(self.tokenizer.word_to_idx)}")
     
-    def train(self, training_data, price_feedback_data=None, validation_data=None, epochs=100, batch_size=32):
-        """
-        Modell tanítása
-        
-        Paraméterek:
-            training_data (dict): Tanítási adatok
-            validation_data (dict): Validációs adatok (opcionális)
-            epochs (int): Tanítási epochok száma
-            batch_size (int): Batch méret
-        """
-        # Training data előkészítése
+    def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
+        """Train the multi-task model"""
         X_keywords = np.array(training_data['keywords'])
-        X_companies = np.array(training_data['company_embeddings'])
+        X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
         
-        # Financial weights csak ha van price feedback data
-        if price_feedback_data:
-            X_financial_weights = self.update_financial_weights(price_feedback_data, X_keywords, X_companies, training_data)
-        else:
-            # Uniform weights alapértelmezettként
-            X_financial_weights = np.ones((len(X_keywords), self.max_keywords)) / self.max_keywords
+        y_price_changes = np.array(training_data['price_changes'])
+        y_volatility_changes = np.array(training_data['volatility_changes'])
+        y_relevance = np.array(training_data['relevance_labels'])
+        y_news_targets = np.array(training_data['news_targets'])
         
-        # Target adatok
-        y_caps = np.array(training_data['capitalization_changes'])
-        y_reconstructions = np.array(training_data['keyword_targets'])
-        y_financial_attention = X_financial_weights.copy()
+        # Create attention regularization targets (uniform distribution encourages diverse attention)
+        y_attention_reg = np.ones((len(X_keywords), self.max_keywords)) / self.max_keywords
         
-        # Validation data előkészítése hasonlóan
         validation_data_prepared = None
         if validation_data:
             val_X_keywords = np.array(validation_data['keywords'])
-            val_X_companies = np.array(validation_data['company_embeddings'])
-            val_X_financial_weights = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
-            val_y_caps = np.array(validation_data['capitalization_changes'])
-            val_y_reconstructions = np.array(validation_data['keyword_targets'])
-            val_y_financial_attention = val_X_financial_weights.copy()
+            val_X_company_indices = np.array(validation_data['company_indices']).reshape(-1, 1)
+            val_y_price_changes = np.array(validation_data['price_changes'])
+            val_y_volatility_changes = np.array(validation_data['volatility_changes'])
+            val_y_relevance = np.array(validation_data['relevance_labels'])
+            val_y_news_targets = np.array(validation_data['news_targets'])
+            val_y_attention_reg = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
             
             validation_data_prepared = (
-                [val_X_keywords, val_X_companies, val_X_financial_weights],
-                [val_y_caps, val_y_reconstructions, val_y_financial_attention]
+                [val_X_keywords, val_X_company_indices],
+                [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
             )
         
-        # Callbacks
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
                 monitor='val_loss' if validation_data else 'loss',
-                patience=10,
+                patience=15,
                 restore_best_weights=True
             ),
             tf.keras.callbacks.ReduceLROnPlateau(
                 monitor='val_loss' if validation_data else 'loss',
                 factor=0.5,
-                patience=5,
+                patience=8,
                 min_lr=1e-6
             )
         ]
         
-        # Modell tanítása
         history = self.model.fit(
-            [X_keywords, X_companies, X_financial_weights],
-            [y_caps, y_reconstructions, y_financial_attention],
+            [X_keywords, X_company_indices],
+            [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
             validation_data=validation_data_prepared,
             epochs=epochs,
             batch_size=batch_size,
@@ -278,130 +265,138 @@ class AttentionBasedNewsFactorModel:
             verbose=1
         )
         
-        logger.info("Modell tanítása befejezve")
         return history
         
-    def update_financial_weights(self, price_feedback_data, X_keywords, X_companies, training_data):
-        """
-        Financial weights frissítése training adatokkal
-        """
-        X_financial_weights = []
+    def predict_impact(self, news_text, company_symbol, return_detailed=False):
+        """Predict impact of news on company"""
+        keyword_sequence = self.prepare_keyword_sequence(news_text)
+        company_idx = self.company_system.get_company_idx(company_symbol)
         
-        # Financial tracker frissítése historikus adatokkal
-        for feedback in price_feedback_data:
-            words = self.tokenizer.tokenize_text(feedback['news_text'])
-            self.financial_tracker.update_impact(
-                words=words,
-                company=feedback['company'],
-                price_change_1d=feedback['price_change_1d'],
-                price_change_5d=feedback['price_change_5d']
-            )
-        
-        # Financial weights generálása minden training sample-hoz
-        company_symbols = training_data.get('company_symbols', [])
-        news_texts = training_data.get('news_texts', [])
-        
-        for i in range(len(X_keywords)):
-            # Alapértelmezett értékek ha nincs elég adat
-            if i < len(company_symbols) and i < len(news_texts):
-                company = company_symbols[i] 
-                text = news_texts[i]
-                fin_weights = self._prepare_financial_weights(text, company)
-            else:
-                # Uniform weights ha nincs adat
-                fin_weights = np.ones(self.max_keywords) / self.max_keywords
-                
-            X_financial_weights.append(fin_weights)
-
-        return np.array(X_financial_weights)
-        
-    def predict_capitalization_change(self, keyword_sequence, company_embedding, news_text=None, company_symbol=None, return_detailed=False):
-        """
-        Integrált predikció attention súlyokkal
-        
-        ParamÉterek:
-            keyword_sequence (numpy.ndarray): Kulcsszó szekvencia
-            company_embedding (numpy.ndarray): Cég beágyazása
-            news_text (str): Eredeti hír szöveg (opcionális)
-            company_symbol (str): Cég szimbólum (opcionális)
-            return_detailed (bool): Részletes eredmény visszaadása
-            
-        Returns:
-            numpy.ndarray vagy dict: Előrejelzett változások
-        """
-        # Dimenzió ellenőrzése
         if keyword_sequence.ndim == 1:
             keyword_sequence = keyword_sequence.reshape(1, -1)
-        if company_embedding.ndim == 1:
-            company_embedding = company_embedding.reshape(1, -1)
+        company_idx_array = np.array([[company_idx]])
         
-        # Financial weights előkészítése
-        if news_text and company_symbol:
-            financial_weights = self._prepare_financial_weights(news_text, company_symbol)
-            financial_weights = financial_weights.reshape(1, -1)
-        else:
-            financial_weights = np.ones((1, self.max_keywords)) / self.max_keywords
+        predictions = self.model.predict([keyword_sequence, company_idx_array], verbose=0)
         
-        # Predikció
-        predictions = self.model.predict([keyword_sequence, company_embedding, financial_weights], verbose=0)
-        capitalization_pred = predictions[0][0]
-        reconstruction_pred = predictions[1][0]
-        financial_attention_pred = predictions[2][0]
+        price_pred = predictions[0][0]  # [1d, 5d, 20d returns]
+        volatility_pred = predictions[1][0]  # [volatility_change, volume_change]
+        relevance_pred = predictions[2][0][0]  # relevance score
+        reconstruction_pred = predictions[3][0]  # news reconstruction
         
         if return_detailed:
-            # Decoded keywords az interpretációhoz
-            decoded_keywords = []
-            for idx in keyword_sequence[0]:
-                if idx in self.tokenizer.idx_to_word:
-                    decoded_keywords.append(self.tokenizer.idx_to_word[idx])
-                else:
-                    decoded_keywords.append('[UNK]')
-            
             return {
-                'capitalization_prediction': capitalization_pred,
-                'learned_financial_attention': financial_attention_pred,
-                'input_financial_weights': financial_weights[0],
-                'reconstruction_quality': reconstruction_pred,
-                'attention_analysis': {
-                    'decoded_keywords': decoded_keywords,
-                    'top_financial_keywords': self._get_top_keywords(decoded_keywords, financial_attention_pred, top_k=5),
-                    'confidence_score': np.mean(np.abs(capitalization_pred))
-                }
+                'price_changes': {
+                    '1d': price_pred[0],
+                    '5d': price_pred[1],
+                    '20d': price_pred[2]
+                },
+                'volatility_changes': {
+                    'volatility': volatility_pred[0],
+                    'volume_proxy': volatility_pred[1]
+                },
+                'relevance_score': relevance_pred,
+                'reconstruction_quality': np.mean(np.abs(reconstruction_pred)),
+                'company_idx': company_idx,
+                'confidence': relevance_pred  # Use relevance as confidence proxy
             }
         else:
-            return capitalization_pred
-        
-    def _prepare_financial_weights(self, text, company):
-        """
-        Financial attention súlyok előkészítése
-        """
-        words = self.tokenizer.tokenize_text(text)
-        
-        # Lekérjük a pénzügyi súlyokat
-        financial_weights = self.financial_tracker.get_financial_attention_weights(
-            words[:self.max_keywords], company
-        )
-        
-        # Padding/truncation
-        if len(financial_weights) < self.max_keywords:
-            padding = np.zeros(self.max_keywords - len(financial_weights))
-            financial_weights = np.concatenate([financial_weights, padding])
-        else:
-            financial_weights = financial_weights[:self.max_keywords]
-            
-        return financial_weights
+            return price_pred
     
-    def _get_top_keywords(self, decoded_keywords, attention_weights, top_k=5):
-        """
-        Top-k kulcsszavak a legnagyobb attention súllyal
-        """
-        non_pad_indices = [i for i, word in enumerate(decoded_keywords) if word != '[PAD]' and i < len(attention_weights)]
+    def get_similar_companies_by_news_response(self, target_company, top_k=5):
+        """Find companies with similar news response patterns using learned embeddings"""
+        target_idx = self.company_system.get_company_idx(target_company)
         
-        if not non_pad_indices:
+        # Extract company embeddings from the model
+        company_embedding_layer = self.model.get_layer('learnable_company_embeddings')
+        all_embeddings = company_embedding_layer.get_weights()[0]  # Shape: (num_companies, company_dim)
+        
+        target_embedding = all_embeddings[target_idx]
+        similarities = []
+        
+        for i, embedding in enumerate(all_embeddings):
+            if i != target_idx:
+                similarity = np.dot(target_embedding, embedding) / (
+                    np.linalg.norm(target_embedding) * np.linalg.norm(embedding) + 1e-8
+                )
+                company_symbol = self.company_system.idx_to_company[i]
+                similarities.append((company_symbol, similarity))
+        
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
+        
+    def get_similar_keywords_by_impact(self, target_word, top_k=10):
+        """Find keywords with similar market impact patterns using learned embeddings"""
+        if target_word not in self.tokenizer.word_to_idx:
             return []
         
-        word_attention_pairs = [(decoded_keywords[i], attention_weights[i]) for i in non_pad_indices]
-        word_attention_pairs.sort(key=lambda x: x[1], reverse=True)
+        target_idx = self.tokenizer.word_to_idx[target_word]
         
-        return word_attention_pairs[:top_k]
+        # Extract keyword embeddings from the model
+        keyword_embedding_layer = self.model.get_layer('impact_aware_keyword_embeddings')
+        all_embeddings = keyword_embedding_layer.get_weights()[0]  # Shape: (vocab_size, keyword_dim)
+        
+        if target_idx >= len(all_embeddings):
+            return []
+        
+        target_embedding = all_embeddings[target_idx]
+        similarities = []
+        
+        for word, idx in self.tokenizer.word_to_idx.items():
+            if idx != target_idx and idx < len(all_embeddings) and word not in ['[PAD]', '[UNK]', '[CLS]', '[SEP]']:
+                embedding = all_embeddings[idx]
+                similarity = np.dot(target_embedding, embedding) / (
+                    np.linalg.norm(target_embedding) * np.linalg.norm(embedding) + 1e-8
+                )
+                similarities.append((word, similarity))
+        
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
     
+    def analyze_keyword_impact_clusters(self, sample_keywords, return_matrix=False):
+        """Analyze how keywords cluster based on their learned impact patterns"""
+        if not sample_keywords:
+            return {}
+        
+        keyword_embedding_layer = self.model.get_layer('impact_aware_keyword_embeddings')
+        all_embeddings = keyword_embedding_layer.get_weights()[0]
+        
+        valid_keywords = []
+        embeddings = []
+        
+        for word in sample_keywords:
+            if word in self.tokenizer.word_to_idx:
+                idx = self.tokenizer.word_to_idx[word]
+                if idx < len(all_embeddings):
+                    valid_keywords.append(word)
+                    embeddings.append(all_embeddings[idx])
+        
+        if len(valid_keywords) < 2:
+            return {}
+        
+        embeddings = np.array(embeddings)
+        
+        # Compute similarity matrix
+        similarity_matrix = np.dot(embeddings, embeddings.T) / (
+            np.linalg.norm(embeddings, axis=1)[:, None] * np.linalg.norm(embeddings, axis=1)[None, :] + 1e-8
+        )
+        
+        # Find clusters of similar-impact keywords
+        clusters = {}
+        for i, word1 in enumerate(valid_keywords):
+            similar_words = []
+            for j, word2 in enumerate(valid_keywords):
+                if i != j and similarity_matrix[i, j] > 0.7:  # High similarity threshold
+                    similar_words.append((word2, similarity_matrix[i, j]))
+            
+            if similar_words:
+                similar_words.sort(key=lambda x: x[1], reverse=True)
+                clusters[word1] = similar_words
+        
+        if return_matrix:
+            return {
+                'clusters': clusters,
+                'similarity_matrix': similarity_matrix,
+                'keywords': valid_keywords
+            }
+        else:
+            return clusters

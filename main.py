@@ -72,35 +72,31 @@ def create_sample_data():
 if __name__ == "__main__":
     logger.info("Fejlett hírfaktor-elemző kereskedési rendszer indítása...")
     
-    # Minta adatok létrehozása
+    # Create sample data
     companies_df, sample_news, sample_prices = create_sample_data()
     companies_df.to_csv('sp500_companies.csv', index=False)
     
-    # 1. Company Embedding System inicializálása
     company_system = CompanyEmbeddingSystem('sp500_companies.csv')
+    news_model = AttentionBasedNewsFactorModel(company_system)
     
-    # 2. Attention-alapú modell inicializálása
-    news_model = AttentionBasedNewsFactorModel()
-    
-    # 3. FONTOS: Szótár építése a hírekből
+    # Build vocabulary
     all_news_texts = [news['text'] for news in sample_news]
     news_model.build_vocabulary(all_news_texts)
-    
-    # 4. Cégek beágyazásainak létrehozása
+
+    # Store static company features (used for initialization/analysis)
     for _, company_row in companies_df.iterrows():
         symbol = company_row['symbol']
         
-        # Minta adatok generálása (ugyanaz mint előtte)
         fundamental_data = {
             'market_cap': np.random.uniform(10e9, 1e12),
             'pe_ratio': np.random.uniform(10, 40),
             'revenue_growth': np.random.uniform(-0.1, 0.3),
-            'profit_margin': np.random.uniform(0.05, 0.25),
+            'profit_margin': np.random.uniform(0.01, 0.3),
             'debt_to_equity': np.random.uniform(0.1, 2.0),
-            'roa': np.random.uniform(0.01, 0.15),
-            'current_ratio': np.random.uniform(0.8, 3.0),
-            'book_value': np.random.uniform(50, 200),
-            'dividend_yield': np.random.uniform(0, 0.05),
+            'roa': np.random.uniform(-0.05, 0.2),
+            'current_ratio': np.random.uniform(0.5, 3.0),
+            'book_value': np.random.uniform(10, 500),
+            'dividend_yield': np.random.uniform(0, 0.08),
             'beta': np.random.uniform(0.5, 2.0)
         }
         
@@ -115,59 +111,71 @@ if __name__ == "__main__":
             'rsi': np.random.uniform(20, 80)
         }
         
-        # Szektoriális információk
+        # Sectoral information
         sector_info = {'sector': company_row['sector']}
         
-        # Minta hírek a cégről
-        company_news = [news['text'] for news in sample_news if symbol in news['companies']]
-        
-        company_system.create_company_embedding(
+        company_system.store_static_features(
             symbol=symbol,
-            news_texts=company_news,
             fundamental_data=fundamental_data,
             price_data=price_data,
             sector_info=sector_info
         )
     
-    # 5. Híradatok feldolgozása tanításhoz
+    # Process training data
     data_processor = NewsDataProcessor(company_system, news_model)
     training_data = data_processor.process_news_batch(sample_news, sample_prices)
     
-    # 6. Modell tanítása
+    # Test keyword impact clustering
     if len(training_data['keywords']) >= 5:
-        logger.info("Modell tanítása...")
-        history = news_model.train(
-            training_data=training_data,
-            epochs=10,
-            batch_size=2
-        )
-        logger.info("Modell tanítása befejezve")
-    else:
-        logger.warning("Túl kevés tanítási adat, modell nem tanítva")
+        print("Training multi-task model...")
+        history = news_model.train(training_data=training_data, epochs=20, batch_size=4)
+        print("Training completed!")
+        
+        # Analyze keyword impact patterns
+        test_keywords = ['breakthrough', 'revenue', 'profit', 'loss', 'acquisition', 'bankruptcy', 'innovation', 'decline']
+        keyword_clusters = news_model.analyze_keyword_impact_clusters(test_keywords)
+        
+        print("\nKeyword Impact Clusters (words with similar market effects):")
+        for keyword, similar_words in keyword_clusters.items():
+            if similar_words:  # Only show keywords that have similar ones
+                similar_names = [word for word, sim in similar_words[:3]]
+                print(f"  '{keyword}' clusters with: {similar_names}")
+        
+        # Test specific keyword similarity
+        test_word = 'breakthrough'
+        if test_word in news_model.tokenizer.word_to_idx:
+            similar_keywords = news_model.get_similar_keywords_by_impact(test_word, top_k=5)
+            print(f"\nKeywords with similar impact to '{test_word}':")
+            for word, similarity in similar_keywords:
+                print(f"  {word}: {similarity:.3f}")
     
-    # 7. Kereskedési rendszer inicializálása
+    
+    # Create trading system
     trading_system = AdvancedTradingSystem(company_system, news_model)
     
-    # 8. Új hír elemzése fejlett tokenizálással
-    test_news = "Tesla reports breakthrough in battery technology, expects 50% cost reduction"
-    target_companies = ['TSLA', 'AAPL']
+    # Test the system
+    test_news = "Tesla reports breakthrough in battery technology, expects 50% cost reduction and improved range"
+    target_companies = ['TSLA', 'AAPL', 'F', 'GM']
     
-    logger.info("Fejlett tokenizálás teszt:")
-    test_tokens = news_model.prepare_keyword_sequence(test_news)
-    logger.info(f"Tokenizált hír: {test_tokens[:10]}...")  # Első 10 token
+    print(f"\nAnalyzing news: {test_news}")
+    print(f"Target companies: {target_companies}")
     
     news_impact = trading_system.analyze_news_impact(test_news, target_companies)
-    logger.info(f"Hírelemzés eredmények: {news_impact}")
     
-    # 9. Attention weights elemzése
-    if 'TSLA' in news_impact:
-        test_company_embedding = company_system.company_embeddings['TSLA']
-        attention_info = news_model.get_attention_weights(test_tokens, test_company_embedding)
-        logger.info(f"Kulcsszavak: {attention_info['decoded_keywords'][:10]}")
-        logger.info(f"Szekvencia hossz: {attention_info['sequence_length']}")
+    for company, analysis in news_impact.items():
+        print(f"\n{company}:")
+        print(f"  Relevance Score: {analysis['relevance_score']:.3f}")
+        print(f"  Confidence: {analysis['confidence']:.3f}")
+        print(f"  Price Changes: 1d={analysis['predicted_changes']['1d']:.3f}, "
+              f"5d={analysis['predicted_changes']['5d']:.3f}, "
+              f"20d={analysis['predicted_changes']['20d']:.3f}")
+        print(f"  Volatility Impact: {analysis['volatility_impact']['volatility']:.3f}")
+        print(f"  Similar Companies: {[comp[0] for comp in analysis['similar_companies'][:2]]}")
     
-    # 10. Kereskedési folyamat
-    trading_signals = trading_system.generate_trading_signals(news_impact)
+    # Generate and execute trading signals
+    trading_signals = trading_system.generate_trading_signals(news_impact, 
+                                                            relevance_threshold=0.3, 
+                                                            confidence_threshold=0.3)
     executed_trades = trading_system.execute_trades(trading_signals)
     
     # 11. Teljesítmény elemzése

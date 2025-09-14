@@ -4,18 +4,10 @@ import logging
 logger = logging.getLogger("AdvancedNewsFactor.NewsDataProcessor")
 
 class NewsDataProcessor:
-    """
-    Híradatok feldolgozása a modell tanításához
-    """
+    """Processing news data to train the model"""
     
     def __init__(self, company_system, news_model):
-        """
-        Inicializálja a híradatok feldolgozót
-        
-        Paraméterek:
-            company_system (CompanyEmbeddingSystem): Cég beágyazási rendszer
-            news_model (AttentionBasedNewsFactorModel): Hírfaktor modell
-        """
+        """Initialize the news data processor"""
         self.company_system = company_system
         self.news_model = news_model
         self.processed_news = []
@@ -23,21 +15,14 @@ class NewsDataProcessor:
         logger.info("NewsDataProcessor inicializálva")
     
     def process_news_batch(self, news_data, price_data):
-        """
-        Hírek batch-feldolgozása tanítási adatok létrehozásához
-        
-        Paraméterek:
-            news_data (list): Hírek listája [{'text': ..., 'companies': [...], 'timestamp': ...}]
-            price_data (dict): Árfolyamadatok {company: {timestamp: price}}
-            
-        Visszatérési érték:
-            dict: Feldolgozott tanítási adatok
-        """
+        """Prepare multi-task training data"""
         training_samples = {
             'keywords': [],
-            'company_embeddings': [],
-            'capitalization_changes': [],
-            'keyword_targets': []
+            'company_indices': [],
+            'price_changes': [],
+            'volatility_changes': [],
+            'relevance_labels': [],
+            'news_targets': []
         }
         
         for news_item in news_data:
@@ -45,56 +30,44 @@ class NewsDataProcessor:
             affected_companies = news_item['companies']
             news_timestamp = news_item['timestamp']
             
-            # Kulcsszó szekvencia készítése
-            keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+            keyword_sequence = self.prepare_keyword_sequence(news_text)
+            news_target = self.company_system.get_bert_embedding(news_text)[:self.latent_dim]
             
-            # Target keyword embedding (BERT-ből)
-            target_embedding = self.company_system.get_bert_embedding(news_text)
-            
-            # Minden érintett céghez egy tanítási példa
             for company in affected_companies:
-                if company not in self.company_system.company_embeddings:
-                    continue
+                company_idx = self.company_system.get_company_idx(company)
                 
-                company_embedding = self.company_system.company_embeddings[company]
-                
-                # Tényleges árfolyamváltozás számítása
                 if company in price_data:
-                    price_changes = self.calculate_price_changes(
-                        price_data[company], news_timestamp
-                    )
+                    # Calculate price changes
+                    price_changes = self.calculate_price_changes(price_data[company], news_timestamp)
                     
-                    if price_changes is not None:
+                    # Calculate volatility changes
+                    volatility_changes = self.calculate_volatility_changes(price_data[company], news_timestamp)
+                    
+                    if price_changes is not None and volatility_changes is not None:
+                        # Determine relevance based on significant price movement
+                        relevance = 1.0 if abs(price_changes[0]) > 0.01 else 0.0  # >1% change = relevant
+                        
                         training_samples['keywords'].append(keyword_sequence)
-                        training_samples['company_embeddings'].append(company_embedding)
-                        training_samples['capitalization_changes'].append(price_changes)
-                        training_samples['keyword_targets'].append(target_embedding[:self.news_model.latent_dim])
+                        training_samples['company_indices'].append(company_idx)
+                        training_samples['price_changes'].append(price_changes)
+                        training_samples['volatility_changes'].append(volatility_changes)
+                        training_samples['relevance_labels'].append(relevance)
+                        training_samples['news_targets'].append(news_target)
         
-        logger.info(f"Feldolgozva {len(training_samples['keywords'])} tanítási példa")
         return training_samples
     
     def calculate_price_changes(self, company_prices, news_timestamp):
-        """
-        Számítja az árfolyamváltozásokat a hír után
-        
-        Paraméterek:
-            company_prices (dict): Árfolyamadatok {timestamp: price}
-            news_timestamp (float): Hír időbélyege
-            
-        Visszatérési érték:
-            numpy.ndarray: [1d_change, 5d_change, 20d_change, volatility_change]
-        """
-        # Időrendbe rakott árak
+        """Calculate price changes for 1d, 5d, 20d periods"""
         sorted_prices = sorted(company_prices.items())
         
-        # Hír időpontjának megkeresése
+        # Find the date of a news item
         base_price = None
         base_idx = None
         
         for i, (timestamp, price) in enumerate(sorted_prices):
             if timestamp >= news_timestamp:
                 if i > 0:
-                    base_price = sorted_prices[i-1][1]  # Az előző ár
+                    base_price = sorted_prices[i-1][1]  # Previous price
                     base_idx = i-1
                 else:
                     base_price = price
@@ -105,10 +78,10 @@ class NewsDataProcessor:
             return None
         
         changes = []
-        periods = [1, 5, 20]  # 1, 5, 20 napos időszakok
+        periods = [1, 5, 20]  # days
         
         for period in periods:
-            # Keresünk árat a period nappal később
+            # We are looking for a price for the period days later.
             target_timestamp = news_timestamp + (period * 24 * 3600)  # seconds
             
             # Legközelebbi ár keresése
@@ -121,75 +94,64 @@ class NewsDataProcessor:
                     min_time_diff = time_diff
                     closest_price = price
                 
-                # Ha túl messze megyünk időben, abbahagyjuk
-                if timestamp > target_timestamp + (2 * 24 * 3600):  # 2 nap tolerancia
+                # If we go too far back in time, we stop.
+                if timestamp > target_timestamp + (2 * 24 * 3600):  # 2 days tolerance
                     break
             
             if closest_price:
                 price_change = (closest_price - base_price) / base_price
                 changes.append(price_change)
             else:
-                changes.append(0.0)  # Nincs adat
-        
-        # Volatilitás változás számítása (egyszerűsített)
-        # Az utolsó 5 nap volatilitása vs. az előző 5 nap volatilitása
-        volatility_change = self.calculate_volatility_change(
-            sorted_prices, base_idx, news_timestamp
-        )
-        changes.append(volatility_change)
+                changes.append(0.0)  # No data
         
         return np.array(changes)
     
-    def calculate_volatility_change(self, sorted_prices, base_idx, news_timestamp):
-        """
-        Volatilitás változásának számítása
+    def calculate_volatility_changes(self, company_prices, news_timestamp):
+        """Calculate volatility and volume changes"""
+        sorted_prices = sorted(company_prices.items())
         
-        Paraméterek:
-            sorted_prices (list): Rendezett árfolyamok
-            base_idx (int): Alapindex
-            news_timestamp (float): Hír időbélyege
-            
-        Visszatérési érték:
-            float: Volatilitás változás
-        """
+        base_idx = None
+        for i, (timestamp, price) in enumerate(sorted_prices):
+            if timestamp >= news_timestamp:
+                base_idx = i-1 if i > 0 else i
+                break
+        
+        if base_idx is None:
+            return None
+        
         try:
-            # Előző 5 nap volatilitása
+            # Pre-news volatility (5 days before)
             pre_prices = []
             for i in range(max(0, base_idx-5), base_idx):
-                pre_prices.append(sorted_prices[i][1])
+                if i < len(sorted_prices):
+                    pre_prices.append(sorted_prices[i][1])
             
-            # Következő 5 nap volatilitása  
+            # Post-news volatility (5 days after)
             post_prices = []
             for i in range(base_idx, min(len(sorted_prices), base_idx+5)):
                 post_prices.append(sorted_prices[i][1])
             
             if len(pre_prices) < 3 or len(post_prices) < 3:
-                return 0.0
+                return np.array([0.0, 0.0])
             
-            # Napi hozamok számítása
-            pre_returns = []
-            for i in range(1, len(pre_prices)):
-                ret = (pre_prices[i] - pre_prices[i-1]) / pre_prices[i-1]
-                pre_returns.append(ret)
+            # Calculate returns
+            pre_returns = [(pre_prices[i] - pre_prices[i-1]) / pre_prices[i-1] 
+                          for i in range(1, len(pre_prices))]
+            post_returns = [(post_prices[i] - post_prices[i-1]) / post_prices[i-1] 
+                           for i in range(1, len(post_prices))]
             
-            post_returns = []
-            for i in range(1, len(post_prices)):
-                ret = (post_prices[i] - post_prices[i-1]) / post_prices[i-1]
-                post_returns.append(ret)
+            # Volatility change
+            pre_vol = np.std(pre_returns) if pre_returns else 0.0
+            post_vol = np.std(post_returns) if post_returns else 0.0
+            vol_change = (post_vol - pre_vol) / (pre_vol + 1e-8)
             
-            if not pre_returns or not post_returns:
-                return 0.0
+            # Volume change proxy (using price range)
+            pre_range = (max(pre_prices) - min(pre_prices)) / np.mean(pre_prices) if pre_prices else 0.0
+            post_range = (max(post_prices) - min(post_prices)) / np.mean(post_prices) if post_prices else 0.0
+            volume_change = (post_range - pre_range) / (pre_range + 1e-8)
             
-            pre_vol = np.std(pre_returns)
-            post_vol = np.std(post_returns)
-            
-            if pre_vol > 0:
-                vol_change = (post_vol - pre_vol) / pre_vol
-            else:
-                vol_change = 0.0
-                
-            return vol_change
+            return np.array([vol_change, volume_change])
             
         except Exception as e:
             logger.warning(f"Volatilitás számítási hiba: {str(e)}")
-            return 0.0
+            return np.array([0.0, 0.0])

@@ -8,27 +8,18 @@ import os
 logger = logging.getLogger("AdvancedNewsFactor.AdvancedTradingSystem")
 
 class AdvancedTradingSystem:
-    """
-    Fejlett kereskedési rendszer az attention-alapú modellel
-    """
-    
+    """Trading system using multi-task learned company embeddings"""
+
     def __init__(self, company_embedding_system, news_factor_model):
-        """
-        Inicializálja a fejlett kereskedési rendszert
-        
-        Paraméterek:
-            company_embedding_system (CompanyEmbeddingSystem): Cég beágyazási rendszer
-            news_factor_model (AttentionBasedNewsFactorModel): Hírfaktor modell
-        """
         self.company_system = company_embedding_system
         self.news_model = news_factor_model
         
-        # Kereskedési adatok
+        # Trading data
         self.positions = {}
         self.portfolio_value = 100000.0
         self.trade_history = []
         
-        # Kockázatkezelés
+        # Risk management
         self.max_position_size = 0.05  # 5% max pozíció
         self.stop_loss_pct = 0.02      # 2% stop loss
         self.take_profit_pct = 0.06    # 6% take profit
@@ -36,86 +27,59 @@ class AdvancedTradingSystem:
         logger.info("AdvancedTradingSystem inicializálva")
     
     def analyze_news_impact(self, news_text, target_companies):
-        """
-        Elemzi egy hír hatását a célcégekre
-        
-        Paraméterek:
-            news_text (str): A hír szövege
-            target_companies (list): Célcégek listája
-            
-        Visszatérési érték:
-            dict: Elemzési eredmények cégenként
-        """
-        # Kulcsszó szekvencia előkészítése
-        keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
-        
+        """Analyze news impact using multi-task predictions"""
         results = {}
         
         for company in target_companies:
-            if company not in self.company_system.company_embeddings:
-                continue
+            if self.company_system.get_company_idx(company) == 0 and company != self.company_system.companies[0]:
+                continue  # Unknown company
                 
-            company_embedding = self.company_system.company_embeddings[company]
+            prediction_result = self.news_model.predict_impact(news_text, company, return_detailed=True)
             
-            # Kapitalizációs változás előrejelzése
-            prediction_result = self.news_model.predict_capitalization_change(keyword_sequence, company_embedding, news_text=news_text, company_symbol=company, return_detailed=True)
+            # Get similar companies based on learned embeddings
+            similar_companies = self.news_model.get_similar_companies_by_news_response(company, top_k=3)
             
             results[company] = {
-                'predicted_changes': {
-                    '1d': prediction_result['capitalization_prediction'][0],
-                    '5d': prediction_result['capitalization_prediction'][1], 
-                    '20d': prediction_result['capitalization_prediction'][2],
-                    'volatility': prediction_result['capitalization_prediction'][3]
-                },
-                'financial_attention_weights': prediction_result['learned_financial_attention'],
-                'input_financial_context': prediction_result['input_financial_weights'],
-                'decoded_keywords': prediction_result['attention_analysis']['decoded_keywords'],
-                'top_financial_keywords': prediction_result['attention_analysis']['top_financial_keywords'],
-                'confidence': prediction_result['attention_analysis']['confidence_score']
+                'predicted_changes': prediction_result['price_changes'],
+                'volatility_impact': prediction_result['volatility_changes'],
+                'relevance_score': prediction_result['relevance_score'],
+                'confidence': prediction_result['confidence'],
+                'similar_companies': similar_companies,
+                'reconstruction_quality': prediction_result['reconstruction_quality']
             }
         
         return results
     
-    def generate_trading_signals(self, news_analysis, risk_threshold=0.6):
-        """
-        Kereskedési jelzések generálása a hírelemzés alapján
-        
-        Paraméterek:
-            news_analysis (dict): Hírelemzés eredményei
-            risk_threshold (float): Kockázati küszöb
-            
-        Visszatérési érték:
-            list: Kereskedési jelzések listája
-        """
+    def generate_trading_signals(self, news_analysis, relevance_threshold=0.6, confidence_threshold=0.5):
+        """Generate trading signals based on multi-task predictions"""
         signals = []
         
         for company, analysis in news_analysis.items():
+            relevance = analysis['relevance_score']
             prediction_1d = analysis['predicted_changes']['1d']
             confidence = analysis['confidence']
             
-            # Jelzés csak ha elég magabiztos a modell
-            if confidence < risk_threshold:
+            # Filter by relevance and confidence
+            if relevance < relevance_threshold or confidence < confidence_threshold:
                 continue
             
-            # Hasonló cégek keresése további kontextusért
-            similar_companies = self.company_system.find_similar_companies(company, top_k=3)
-            
-            # Kereskedési irány meghatározása
-            if prediction_1d > 0.01:  # 1% feletti emelkedés várható
+            # Determine signal type and strength
+            if prediction_1d > 0.01:  # >1% expected increase
                 signal_type = 'BUY'
-                strength = min(prediction_1d * 10, 1.0)  # Normalizálás 0-1 tartományra
-            elif prediction_1d < -0.01:  # 1% feletti esés várható
+                strength = min(prediction_1d * 10, 1.0)
+            elif prediction_1d < -0.01:  # >1% expected decrease
                 signal_type = 'SELL'
                 strength = min(abs(prediction_1d) * 10, 1.0)
             else:
-                continue  # Semleges, nincs jelzés
+                continue  # Neutral, no signal
             
-            # Pozícióméret számítása
+            # Calculate position size based on multiple factors
             position_size = (
                 self.portfolio_value * 
                 self.max_position_size * 
                 strength * 
-                confidence
+                confidence * 
+                relevance
             )
             
             signal = {
@@ -123,53 +87,45 @@ class AdvancedTradingSystem:
                 'type': signal_type,
                 'strength': strength,
                 'confidence': confidence,
+                'relevance': relevance,
                 'position_size': position_size,
                 'predicted_change_1d': prediction_1d,
                 'predicted_change_5d': analysis['predicted_changes']['5d'],
-                'similar_companies': similar_companies,
+                'predicted_change_20d': analysis['predicted_changes']['20d'],
+                'volatility_impact': analysis['volatility_impact']['volatility'],
+                'similar_companies': analysis['similar_companies'],
                 'timestamp': datetime.datetime.now()
             }
             
             signals.append(signal)
         
-        # Rendezés erősség szerint
-        signals.sort(key=lambda x: x['strength'] * x['confidence'], reverse=True)
+        # Sort by combined score (strength * confidence * relevance)
+        signals.sort(key=lambda x: x['strength'] * x['confidence'] * x['relevance'], reverse=True)
         
         return signals
     
     def execute_trades(self, signals, max_trades_per_day=10):
-        """
-        Kereskedések végrehajtása
-        
-        Paraméterek:
-            signals (list): Kereskedési jelzések
-            max_trades_per_day (int): Napi maximum kereskedések száma
-            
-        Visszatérési érték:
-            list: Végrehajtott kereskedések listája
-        """
+        """Execute trades based on signals"""
         executed_trades = []
         
-        for i, signal in enumerate(signals[:max_trades_per_day]):
-            # Portfólió korlátok ellenőrzése
+        for _, signal in enumerate(signals[:max_trades_per_day]):
             current_exposure = sum(abs(pos) for pos in self.positions.values())
             
             if current_exposure + signal['position_size'] > self.portfolio_value * 0.8:
-                logger.warning(f"Portfolio limit elérve, kereskedés kihagyva: {signal['company']}")
                 continue
-            
-            # Kereskedés végrehajtása (szimuláció)
+
             trade = {
                 'company': signal['company'],
                 'type': signal['type'],
                 'size': signal['position_size'],
                 'confidence': signal['confidence'],
+                'relevance': signal['relevance'],
                 'predicted_change': signal['predicted_change_1d'],
                 'timestamp': signal['timestamp'],
                 'executed': True
             }
             
-            # Pozíció frissítése
+            # Position updating
             if signal['company'] not in self.positions:
                 self.positions[signal['company']] = 0
             
@@ -185,28 +141,26 @@ class AdvancedTradingSystem:
         
         return executed_trades
     
-    def save_model_and_data(self, path='advanced_models'):
-        """
-        Modellek és adatok mentése
-        
-        Paraméterek:
-            path (str): Mentési útvonal
-        """
+    def save_model_and_data(self, path='multi_task_models'):
+        """Save the multi-task model and associated data"""
         if not os.path.exists(path):
             os.makedirs(path)
         
-        # Neural network modell mentése
-        self.news_model.model.save(os.path.join(path, 'attention_news_model.h5'))
+        self.news_model.model.save(os.path.join(path, 'multi_task_news_model.h5'))
         
-        # Company embeddings mentése
-        with open(os.path.join(path, 'company_embeddings.pkl'), 'wb') as f:
-            pickle.dump(self.company_system.company_embeddings, f)
+        # Save company mapping
+        with open(os.path.join(path, 'company_system.pkl'), 'wb') as f:
+            pickle.dump({
+                'company_to_idx': self.company_system.company_to_idx,
+                'idx_to_company': self.company_system.idx_to_company,
+                'companies': self.company_system.companies,
+                'static_features': self.company_system.static_features
+            }, f)
         
-        # Tokenizer teljes objektum mentése, nem csak szótárak
         with open(os.path.join(path, 'tokenizer.pkl'), 'wb') as f:
             pickle.dump(self.news_model.tokenizer, f)
         
-        # Trading adatok mentése
+        # Save trading datas
         with open(os.path.join(path, 'trading_data.pkl'), 'wb') as f:
             pickle.dump({
                 'positions': self.positions,
@@ -215,35 +169,24 @@ class AdvancedTradingSystem:
             }, f)
         
         logger.info(f"Modellek és adatok elmentve: {path}")
-    
-    def load_model_and_data(self, path='advanced_models'):
-        """
-        Modellek és adatok betöltése
         
-        Paraméterek:
-            path (str): Betöltési útvonal
-            
-        Visszatérési érték:
-            bool: Sikerült-e a betöltés
-        """
+    def load_model_and_data(self, path='multi_task_models'):
+        """Load the multi-task model and associated data"""
         try:
-            # Neural network modell betöltése
             self.news_model.model = tf.keras.models.load_model(
-                os.path.join(path, 'attention_news_model.h5')
+                os.path.join(path, 'multi_task_news_model.h5')
             )
             
-            # Company embeddings betöltése
-            with open(os.path.join(path, 'company_embeddings.pkl'), 'rb') as f:
-                self.company_system.company_embeddings = pickle.load(f)
+            with open(os.path.join(path, 'company_system.pkl'), 'rb') as f:
+                company_data = pickle.load(f)
+                self.company_system.company_to_idx = company_data['company_to_idx']
+                self.company_system.idx_to_company = company_data['idx_to_company']
+                self.company_system.companies = company_data['companies']
+                self.company_system.static_features = company_data['static_features']
             
-            # Teljes tokenizer objektum betöltése
             with open(os.path.join(path, 'tokenizer.pkl'), 'rb') as f:
                 self.news_model.tokenizer = pickle.load(f)
-                # Referenciák frissítése
-                self.news_model.word_to_idx = self.news_model.tokenizer.word_to_idx
-                self.news_model.idx_to_word = self.news_model.tokenizer.idx_to_word
-            
-            # Trading adatok betöltése
+
             with open(os.path.join(path, 'trading_data.pkl'), 'rb') as f:
                 trading_data = pickle.load(f)
                 self.positions = trading_data['positions']

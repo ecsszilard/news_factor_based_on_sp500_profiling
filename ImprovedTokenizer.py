@@ -6,9 +6,7 @@ import logging
 logger = logging.getLogger("AdvancedNewsFactor.ImprovedTokenizer")
 
 class ImprovedTokenizer:
-    """
-    Fejlett tokenizáló rendszer BERT-szerű tokenizálással
-    """
+    """Advanced tokenization system with BERT-like tokenization"""
     
     def __init__(self, vocab_size=50000):
         self.vocab_size = vocab_size
@@ -18,15 +16,11 @@ class ImprovedTokenizer:
         self.word_freq = defaultdict(int)
         
     def build_vocab(self, texts):
-        """
-        Szótár építése a szövegekből
-        """
         for text in texts:
             words = self.tokenize_text(text)
             for word in words:
                 self.word_freq[word] += 1
         
-        # Gyakoriság szerinti rendezés és szótár építés
         sorted_words = sorted(self.word_freq.items(), key=lambda x: x[1], reverse=True)
         
         for word, freq in sorted_words[:self.vocab_size - 4]:
@@ -36,22 +30,13 @@ class ImprovedTokenizer:
                 self.vocab_count += 1
     
     def tokenize_text(self, text):
-        """
-        Szöveg tokenizálása
-        """
-        # Alapvető tisztítás
         text = text.lower()
-        text = re.sub(r'[^\w\s]', ' ', text)  # Írásjel eltávolítás
-        text = re.sub(r'\s+', ' ', text)      # Többszörös space összevonás
-        
-        # Szavak split
+        text = re.sub(r'[^\w\s]', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
         words = text.strip().split()
-        
-        # Subword tokenizálás egyszerű változata (gyakori prefixek/szuffixek)
         processed_words = []
         for word in words:
             if len(word) > 6:
-                # Hosszú szavakat részekre bontjuk
                 processed_words.extend(self.split_word(word))
             else:
                 processed_words.append(word)
@@ -59,15 +44,11 @@ class ImprovedTokenizer:
         return processed_words
     
     def split_word(self, word):
-        """
-        Szó felosztása subword részekre
-        """
         common_prefixes = ['un', 'pre', 'dis', 'mis', 're', 'over', 'under', 'out']
         common_suffixes = ['ing', 'ed', 'er', 'est', 'ly', 'tion', 'sion', 'ness', 'ment']
         
-        parts = [word]  # Alapértelmezetten az egész szó
+        parts = [word]
         
-        # Prefix keresés
         for prefix in common_prefixes:
             if word.startswith(prefix) and len(word) > len(prefix) + 2:
                 rest = word[len(prefix):]
@@ -75,7 +56,6 @@ class ImprovedTokenizer:
                 word = rest
                 break
         
-        # Suffix keresés (a maradék szón)
         if len(parts) > 1:
             word = parts[-1]
         
@@ -92,9 +72,6 @@ class ImprovedTokenizer:
         return parts
     
     def encode(self, text, max_length=100, add_special_tokens=True):
-        """
-        Szöveg kódolása token ID-kre
-        """
         words = self.tokenize_text(text)
         
         tokens = []
@@ -110,7 +87,6 @@ class ImprovedTokenizer:
         if add_special_tokens:
             tokens.append(self.word_to_idx['[SEP]'])
         
-        # Padding vagy truncation
         if len(tokens) > max_length:
             tokens = tokens[:max_length]
         else:
