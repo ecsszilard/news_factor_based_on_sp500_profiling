@@ -30,8 +30,8 @@ class NewsDataProcessor:
             affected_companies = news_item['companies']
             news_timestamp = news_item['timestamp']
             
-            keyword_sequence = self.prepare_keyword_sequence(news_text)
-            news_target = self.company_system.get_bert_embedding(news_text)[:self.latent_dim]
+            keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+            news_targets = self.company_system.get_bert_embedding(news_text)[:getattr(self.news_model, 'latent_dim', 128)]
             
             for company in affected_companies:
                 company_idx = self.company_system.get_company_idx(company)
@@ -52,7 +52,7 @@ class NewsDataProcessor:
                         training_samples['price_changes'].append(price_changes)
                         training_samples['volatility_changes'].append(volatility_changes)
                         training_samples['relevance_labels'].append(relevance)
-                        training_samples['news_targets'].append(news_target)
+                        training_samples['news_targets'].append(news_targets)
         
         return training_samples
     

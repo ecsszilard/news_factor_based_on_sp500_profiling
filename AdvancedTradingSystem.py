@@ -1,4 +1,3 @@
-import numpy as np
 import tensorflow as tf
 import datetime
 import logging
@@ -33,8 +32,10 @@ class AdvancedTradingSystem:
         for company in target_companies:
             if self.company_system.get_company_idx(company) == 0 and company != self.company_system.companies[0]:
                 continue  # Unknown company
-                
-            prediction_result = self.news_model.predict_impact(news_text, company, return_detailed=True)
+
+            keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+            company_idx = self.company_system.get_company_idx(company)             
+            prediction_result = self.news_model.predict_impact(keyword_sequence, company_idx, return_detailed=True)
             
             # Get similar companies based on learned embeddings
             similar_companies = self.news_model.get_similar_companies_by_news_response(company, top_k=3)
@@ -136,8 +137,7 @@ class AdvancedTradingSystem:
             executed_trades.append(trade)
             self.trade_history.append(trade)
             
-            logger.info(f"Kereskedés végrehajtva: {signal['type']} {signal['company']} "
-                       f"${signal['position_size']:.2f}")
+            logger.info(f"Kereskedés végrehajtva: {signal['type']} {signal['company']} "f"${signal['position_size']:.2f}")
         
         return executed_trades
     

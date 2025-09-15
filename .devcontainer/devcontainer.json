@@ -1,7 +1,8 @@
 {
   "name": "TF GPU Dev",
   "build": {
-    "dockerfile": "../Dockerfile"
+    "dockerfile": "../Dockerfile",
+    "context": ".."
   },
   "runArgs": [
     "--gpus", "all",
@@ -30,5 +31,6 @@
       }
     }
   },
-  "postCreateCommand": "python -m nltk.downloader punkt stopwords"
+  "forwardPorts": [8888, 6006],
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt && python -m nltk.downloader punkt stopwords"
 }

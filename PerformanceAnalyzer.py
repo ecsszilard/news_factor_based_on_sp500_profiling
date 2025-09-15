@@ -1,42 +1,28 @@
 import numpy as np
 import datetime
+import json
 import logging
 
 logger = logging.getLogger("AdvancedNewsFactor.PerformanceAnalyzer")
 
 class PerformanceAnalyzer:
-    """
-    Teljesítményelemző rendszer
-    """
+    """Performance analysis system"""
     
     def __init__(self, trading_system):
-        """
-        Inicializálja a teljesítményelemzőt
-        
-        Paraméterek:
-            trading_system (AdvancedTradingSystem): Kereskedési rendszer
-        """
+        """Initialize the performance analyzer"""
         self.trading_system = trading_system
         
         logger.info("PerformanceAnalyzer inicializálva")
     
     def calculate_returns(self, start_date=None, end_date=None):
-        """
-        Hozamok számítása
-        
-        Paraméterek:
-            start_date (datetime.date): Kezdő dátum
-            end_date (datetime.date): Záró dátum
-            
-        Visszatérési érték:
-            dict: Hozammutatók
-        """
+        """Calculation of yields"""
+
         if start_date is None:
             start_date = datetime.date.today() - datetime.timedelta(days=30)
         if end_date is None:
             end_date = datetime.date.today()
         
-        # Szűrjük a kereskedéseket a megadott időszakra
+        # Filter trades for the specified period
         relevant_trades = [
             trade for trade in self.trading_system.trade_history
             if start_date <= trade['timestamp'].date() <= end_date
@@ -45,19 +31,19 @@ class PerformanceAnalyzer:
         if not relevant_trades:
             return {'error': 'Nincs kereskedés a megadott időszakban'}
         
-        # Napi hozamok szimulációja (valódi implementációban piaci adatok kellenek)
+        # Simulation of daily returns (market data is needed in real implementation)
         daily_returns = []
         cumulative_return = 0.0
         
-        # Egyszerűsített hozamszámítás a előrejelzések alapján
+        # Simplified yield calculation based on forecasts
         for trade in relevant_trades:
             predicted_return = trade['predicted_change']
-            # Feltételezzük 70%-os pontosságot
+            # We assume 70% accuracy
             actual_return = predicted_return * np.random.choice([1, -0.3], p=[0.7, 0.3])
             daily_returns.append(actual_return)
             cumulative_return += actual_return
         
-        # Teljesítménymutatók számítása
+        # Calculation of performance indicators
         if daily_returns:
             avg_return = np.mean(daily_returns)
             volatility = np.std(daily_returns)
@@ -78,15 +64,7 @@ class PerformanceAnalyzer:
         }
     
     def calculate_max_drawdown(self, returns):
-        """
-        Maximum drawdown számítása
-        
-        Paraméterek:
-            returns (list): Napi hozamok listája
-            
-        Visszatérési érték:
-            float: Maximum drawdown
-        """
+        """Maximum drawdown calculation"""
         if not returns:
             return 0.0
         
@@ -142,16 +120,9 @@ class PerformanceAnalyzer:
         return {'error': 'Nincs elég adat az elemzéshez'}
     
     def generate_performance_report(self, save_path=None):
-        """
-        Teljes teljesítményjelentés generálása
+        """Generate a full performance report"""
         
-        Paraméterek:
-            save_path (str): Mentési útvonal (opcionális)
-            
-        Visszatérési érték:
-            dict: Teljes teljesítményjelentés
-        """
-        # Különböző időszakok elemzése
+        # Analysis of different periods
         periods = [7, 30, 90]
         period_results = {}
         
@@ -159,17 +130,16 @@ class PerformanceAnalyzer:
             start_date = datetime.date.today() - datetime.timedelta(days=days)
             period_results[f'{days}d'] = self.calculate_returns(start_date)
         
-        # Előrejelzési pontosság
         prediction_accuracy = self.analyze_prediction_accuracy({})
         
-        # Portfolio összetétel
+        # Portfolio composition
         portfolio_composition = {
             company: position for company, position 
             in self.trading_system.positions.items() 
-            if abs(position) > 100  # Csak jelentős pozíciók
+            if abs(position) > 100
         }
         
-        # Teljes jelentés összeállítása
+        # Compile a full report
         report = {
             'generated_at': datetime.datetime.now().isoformat(),
             'portfolio_value': self.trading_system.portfolio_value,
@@ -184,7 +154,6 @@ class PerformanceAnalyzer:
             )[:10])
         }
         
-        # Mentés ha kért
         if save_path:
             with open(save_path, 'w') as f:
                 json.dump(report, f, indent=2, default=str)

@@ -1,33 +1,41 @@
+import logging
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import (Input, Dense, Embedding, Dropout, LayerNormalization, MultiHeadAttention, Reshape, Flatten, Concatenate, BatchNormalization)
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-import logging
-
-from BiDirectionalAttentionLayer import BiDirectionalAttentionLayer
-from ImprovedTokenizer import ImprovedTokenizer
-from FinancialImpactTracker import FinancialImpactTracker
+import tensorflow_addons as tfa
 
 logger = logging.getLogger("AdvancedNewsFactor.AttentionBasedNewsFactorModel")
+layers = tf.keras.layers
+models = tf.keras.models
+optimizers = tf.keras.optimizers
+regularizers = tf.keras.regularizers
+callbacks = tf.keras.callbacks
 
 class AttentionBasedNewsFactorModel:
     """Multi-task learning model for news sentiment analysis with shared company embeddings"""
 
-    def __init__(self, company_system, vocab_size=50000, keyword_dim=256, company_dim=256, latent_dim=128, max_keywords=100):
+    def __init__(self, company_system, tokenizer, keyword_dim=256, company_dim=128, latent_dim=128, max_keywords=100):
         self.company_system = company_system
-        self.vocab_size = vocab_size
         self.keyword_dim = keyword_dim
         self.company_dim = company_dim
         self.latent_dim = latent_dim
         self.max_keywords = max_keywords
-        
-        self.tokenizer = ImprovedTokenizer(vocab_size)
+        self.tokenizer = tokenizer
+
         self.model = self.build_model()
         
-        # Multi-task loss weights
+        # BERT optimizer, but it is worth considering LAMB for a lot of news
+        optimizer = optimizers.Adam(
+            learning_rate=optimizers.schedules.CosineDecayRestarts(
+                initial_learning_rate=0.1,
+                first_decay_steps=1000,
+                t_mul=2.0,
+                m_mul=1.0,
+                alpha=0.0
+            )
+        )
+        
         self.model.compile(
-            optimizer=Adam(learning_rate=0.001),
+            optimizer=optimizer,
             loss={
                 'price_change_prediction': 'mse',
                 'volatility_prediction': 'mse',
@@ -45,7 +53,7 @@ class AttentionBasedNewsFactorModel:
             metrics={
                 'price_change_prediction': ['mae'],
                 'volatility_prediction': ['mae'],
-                'relevance_prediction': ['accuracy'],
+                'relevance_prediction':  ['accuracy', tfa.metrics.F1Score(num_classes=2, average='macro')],
                 'news_reconstruction': ['mae'],
                 'attention_regularization': ['accuracy']
             }
@@ -58,36 +66,36 @@ class AttentionBasedNewsFactorModel:
         # -----------------------------
         # 1. Inputs
         # -----------------------------
-        keyword_input = Input(shape=(self.max_keywords,), name='keywords')
-        company_idx_input = Input(shape=(1,), name='company_idx', dtype='int32')
+        keyword_input = layers.Input(shape=(self.max_keywords,), name='keywords')
+        company_idx_input = layers.Input(shape=(1,), name='company_idx', dtype='int32')
 
         # -----------------------------
         # 2. Keyword encoder (impact-aware)
         # -----------------------------
-        keyword_embedding = Embedding(
-            input_dim=self.vocab_size,
+        keyword_embedding = layers.Embedding(
+            input_dim=self.tokenizer.vocab_size,
             output_dim=self.keyword_dim,
             mask_zero=True,
-            embeddings_regularizer=l1_l2(1e-5, 1e-4),
+            embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='keyword_embeddings'
         )(keyword_input) # These learn impact patterns
 
-        attn_keywords = MultiHeadAttention(
+        attn_keywords = layers.MultiHeadAttention(
             num_heads=8,
             key_dim=self.keyword_dim // 8,
             dropout=0.1,
             name='keyword_attention'
         )(keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
 
-        keyword_latent = Dense(
+        keyword_latent = layers.Dense(
             self.latent_dim,
             activation='relu',
-            kernel_regularizer=l1_l2(1e-5, 1e-4),
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='keyword_transform'
-        )(LayerNormalization()(attn_keywords + keyword_embedding))
-        keyword_latent = Dropout(0.2)(keyword_latent)
+        )(layers.LayerNormalization()(attn_keywords + keyword_embedding))
+        keyword_latent = layers.Dropout(0.2)(keyword_latent)
 
-        keyword_impact = Dense(
+        keyword_impact = layers.Dense(
             self.latent_dim,
             activation='tanh',
             name='impact_regularization'
@@ -96,47 +104,46 @@ class AttentionBasedNewsFactorModel:
         # -----------------------------
         # 3. Company embedding
         # -----------------------------
-        company_emb = Embedding(
+        company_emb = layers.Embedding(
             input_dim=self.company_system.num_companies,
             output_dim=self.company_dim,
             name='company_embeddings'
         )(company_idx_input)
 
-        company_proc = Dense(
+        company_proc = layers.Dense(
             self.latent_dim,
             activation='relu',
-            kernel_regularizer=l1_l2(1e-5, 1e-4),
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='company_processed'
         )(company_emb)
-        company_proc = BatchNormalization()(company_proc)
-        company_proc = Dropout(0.1)(company_proc)
-        company_reshaped = Reshape((1, self.latent_dim))(company_proc)
+        company_proc = layers.BatchNormalization()(company_proc)
+        company_proc = layers.Dropout(0.1)(company_proc)
+        company_reshaped = layers.Reshape((1, self.latent_dim))(company_proc)
 
-        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein,
-        # ha többdimenziós cégháló-struktúrát (pl. szektor, beszállítói lánc) akarunk modellezni.
-        # Ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
+        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein, ha többdimenziós cégháló-struktúrát 
+        # (pl. szektor, beszállítói lánc) akarunk modellezni, ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
 
         # -----------------------------
         # 4. Bi-directional attention
         # -----------------------------
-        comp_to_news = MultiHeadAttention(
+        comp_to_news = layers.MultiHeadAttention(
             num_heads=4,
             key_dim=self.latent_dim // 4,
             name='company_to_news'
         )(company_reshaped, keyword_impact, keyword_impact)
 
-        news_to_comp = MultiHeadAttention(
+        news_to_comp = layers.MultiHeadAttention(
             num_heads=4,
             key_dim=self.latent_dim // 4,
             name='news_to_company'
         )(keyword_impact, company_reshaped, company_reshaped)
 
-        combined = Concatenate(axis=-1)([
+        combined = layers.Concatenate(axis=-1)([
             comp_to_news,
             tf.reduce_mean(news_to_comp, axis=1, keepdims=True)
         ])
 
-        combined_norm = LayerNormalization()(Dense(
+        combined_norm = layers.LayerNormalization()(layers.Dense(
             self.latent_dim,
             activation='tanh',
             name='attention_combination'
@@ -145,73 +152,63 @@ class AttentionBasedNewsFactorModel:
         # -----------------------------
         # 5. Shared representation
         # -----------------------------
-        combined_features = Concatenate()([
-            Flatten()(combined_norm),
-            Flatten()(company_proc),
-            GlobalAveragePooling1D()(keyword_impact)
+        combined_features = layers.Concatenate()([
+            layers.Flatten()(combined_norm),
+            layers.Flatten()(company_proc),
+            layers.GlobalAveragePooling1D()(keyword_impact)
         ])
 
-        x = Dense(256, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4))(combined_features)
-        x = BatchNormalization()(x)
-        x = Dropout(0.3)(x)
+        x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4))(combined_features)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.3)(x)
 
-        shared = Dense(128, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4), name='shared_rep')(x)
-        shared = BatchNormalization()(shared)
-        shared = Dropout(0.2)(shared)
+        shared = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4), name='shared_rep')(x)
+        shared = layers.BatchNormalization()(shared)
+        shared = layers.Dropout(0.2)(shared)
 
         # -----------------------------
         # 6. Prediction heads
         # -----------------------------
-        price = Dense(64, activation='relu')(shared)
-        price = Dropout(0.1)(price)
-        price_out = Dense(3, activation='linear', name='price_prediction')(price)
+        price = layers.Dense(64, activation='relu')(shared)
+        price = layers.Dropout(0.1)(price)
+        price_out = layers.Dense(3, activation='linear', name='price_change_prediction')(price)
 
-        vol = Dense(64, activation='relu')(shared)
-        vol = Dropout(0.1)(vol)
-        vol_out = Dense(2, activation='linear', name='volatility_prediction')(vol)
+        vol = layers.Dense(64, activation='relu')(shared)
+        vol = layers.Dropout(0.1)(vol)
+        vol_out = layers.Dense(2, activation='linear', name='volatility_prediction')(vol)
 
-        rel = Dense(32, activation='relu')(shared)
-        rel = Dropout(0.1)(rel)
-        rel_out = Dense(1, activation='sigmoid', name='relevance_prediction')(rel)
+        rel = layers.Dense(32, activation='relu')(shared)
+        rel = layers.Dropout(0.1)(rel)
+        rel_out = layers.Dense(1, activation='sigmoid', name='relevance_prediction')(rel)
 
         recon_out = self._create_news_recon(keyword_latent, shared, company_emb)
 
-        attn_reg = Dense(64, activation='relu', kernel_regularizer=l1_l2(1e-5, 1e-4))(shared)
-        attn_reg = Dropout(0.1)(attn_reg)
-        attn_reg_out = Dense(self.max_keywords, activation='softmax', name='attention_regularization')(attn_reg)
+        attn_reg = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4))(shared)
+        attn_reg = layers.Dropout(0.1)(attn_reg)
+        attn_reg_out = layers.Dense(self.max_keywords, activation='softmax', name='attention_regularization')(attn_reg)
 
-        return Model(
+        return models.Model(
             inputs=[keyword_input, company_idx_input],
             outputs=[price_out, vol_out, rel_out, recon_out, attn_reg_out],
             name='NewsFactorModel'
         )
 
     def _create_news_recon(self, keyword_latent, shared, company_emb):
-        d = tf.shape(keyword_latent)[-1]
-        scale = tf.sqrt(tf.cast(d, tf.float32))
-
+        scale = tf.sqrt(tf.cast(self.latent_dim, tf.float32))
+        
         scores = tf.einsum('bcd,btd->bct', company_emb, keyword_latent) / scale
         attn_weights = tf.nn.softmax(scores, axis=-1)
         company_context = tf.einsum('bct,btd->bcd', attn_weights, keyword_latent)
 
-        comp_importance = Dense(1)(company_context)
+        comp_importance = layers.Dense(1)(company_context)
         comp_importance = tf.nn.softmax(tf.squeeze(comp_importance, -1), axis=-1)
         comp_importance = tf.expand_dims(comp_importance, -1)
         pooled_news = tf.reduce_sum(company_context * comp_importance, axis=1)
 
-        global_hidden = Dense(128, activation='relu')(shared)
-        recon_input = Concatenate(axis=-1)([global_hidden, pooled_news])
-        recon_input = Dropout(0.2)(recon_input)
-        return Dense(d, activation='tanh', name='news_reconstruction')(recon_input)
-        
-        
-    def prepare_keyword_sequence(self, text, max_length=None):
-        if max_length is None:
-            max_length = self.max_keywords
-        return self.tokenizer.encode(text, max_length=max_length)
-        
-    def build_vocabulary(self, news_texts):
-        self.tokenizer.build_vocab(news_texts)
+        global_hidden = layers.Dense(128, activation='relu')(shared)
+        recon_input = layers.Concatenate(axis=-1)([global_hidden, pooled_news])
+        recon_input = layers.Dropout(0.2)(recon_input)
+        return layers.Dense(self.latent_dim, activation='tanh', name='news_reconstruction')(recon_input)
     
     def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
         """Train the multi-task model"""
@@ -241,42 +238,30 @@ class AttentionBasedNewsFactorModel:
                 [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
             )
         
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss' if validation_data else 'loss',
-                patience=15,
-                restore_best_weights=True
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss' if validation_data else 'loss',
-                factor=0.5,
-                patience=8,
-                min_lr=1e-6
-            )
-        ]
-        
         history = self.model.fit(
             [X_keywords, X_company_indices],
             [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
             validation_data=validation_data_prepared,
             epochs=epochs,
             batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=1
-        )
-        
+            callbacks=[
+                callbacks.EarlyStopping(
+                monitor='val_loss' if validation_data else 'loss',
+                patience=15,
+                restore_best_weights=True),
+                callbacks.ReduceLROnPlateau(monitor='val_loss' if validation_data else 'loss', factor=0.5, patience=8, min_lr=1e-6)
+            ],
+            verbose=1)
         return history
-        
-    def predict_impact(self, news_text, company_symbol, return_detailed=False):
+    
+    def prepare_keyword_sequence(self, text, max_length=None):
+        if max_length is None:
+            max_length = self.max_keywords
+        return self.tokenizer.encode(text, max_length=max_length)
+    
+    def predict_impact(self, keyword_sequence, company_idx, return_detailed=False):
         """Predict impact of news on company"""
-        keyword_sequence = self.prepare_keyword_sequence(news_text)
-        company_idx = self.company_system.get_company_idx(company_symbol)
-        
-        if keyword_sequence.ndim == 1:
-            keyword_sequence = keyword_sequence.reshape(1, -1)
-        company_idx_array = np.array([[company_idx]])
-        
-        predictions = self.model.predict([keyword_sequence, company_idx_array], verbose=0)
+        predictions = self.model.predict([keyword_sequence, np.array([[company_idx]])], verbose=0)
         
         price_pred = predictions[0][0]  # [1d, 5d, 20d returns]
         volatility_pred = predictions[1][0]  # [volatility_change, volume_change]
@@ -307,23 +292,32 @@ class AttentionBasedNewsFactorModel:
         target_idx = self.company_system.get_company_idx(target_company)
         
         # Extract company embeddings from the model
-        company_embedding_layer = self.model.get_layer('learnable_company_embeddings')
-        all_embeddings = company_embedding_layer.get_weights()[0]  # Shape: (num_companies, company_dim)
+        try:
+            company_embedding_layer = self.model.get_layer('company_embeddings')
+            all_embeddings = company_embedding_layer.get_weights()[0] # Shape: (num_companies, company_dim)
+        except ValueError:
+            logger.warning("Company embedding layer not found, returning empty list")
+            return []
+        
+        if target_idx >= len(all_embeddings):
+            return []
         
         target_embedding = all_embeddings[target_idx]
         similarities = []
         
         for i, embedding in enumerate(all_embeddings):
             if i != target_idx:
-                similarity = np.dot(target_embedding, embedding) / (
-                    np.linalg.norm(target_embedding) * np.linalg.norm(embedding) + 1e-8
-                )
-                company_symbol = self.company_system.idx_to_company[i]
-                similarities.append((company_symbol, similarity))
+                target_norm = np.linalg.norm(target_embedding)
+                embedding_norm = np.linalg.norm(embedding)
+                
+                if target_norm > 1e-8 and embedding_norm > 1e-8:
+                    similarity = np.dot(target_embedding, embedding) / (target_norm * embedding_norm)
+                    company_symbol = self.company_system.idx_to_company.get(i, f"UNKNOWN_{i}")
+                    similarities.append((company_symbol, similarity))
         
         similarities.sort(key=lambda x: x[1], reverse=True)
         return similarities[:top_k]
-        
+    
     def get_similar_keywords_by_impact(self, target_word, top_k=10):
         """Find keywords with similar market impact patterns using learned embeddings"""
         if target_word not in self.tokenizer.word_to_idx:
@@ -332,8 +326,12 @@ class AttentionBasedNewsFactorModel:
         target_idx = self.tokenizer.word_to_idx[target_word]
         
         # Extract keyword embeddings from the model
-        keyword_embedding_layer = self.model.get_layer('impact_aware_keyword_embeddings')
-        all_embeddings = keyword_embedding_layer.get_weights()[0]  # Shape: (vocab_size, keyword_dim)
+        try:
+            keyword_embedding_layer = self.model.get_layer('keyword_embeddings')
+            all_embeddings = keyword_embedding_layer.get_weights()[0] # Shape: (vocab_size, keyword_dim)
+        except ValueError:
+            logger.warning("Keyword embedding layer not found, returning empty list")
+            return []
         
         if target_idx >= len(all_embeddings):
             return []
@@ -342,12 +340,15 @@ class AttentionBasedNewsFactorModel:
         similarities = []
         
         for word, idx in self.tokenizer.word_to_idx.items():
-            if idx != target_idx and idx < len(all_embeddings) and word not in ['[PAD]', '[UNK]', '[CLS]', '[SEP]']:
+            if (idx != target_idx and idx < len(all_embeddings) and word not in ['[PAD]', '[UNK]', '[CLS]', '[SEP]']):
+                
                 embedding = all_embeddings[idx]
-                similarity = np.dot(target_embedding, embedding) / (
-                    np.linalg.norm(target_embedding) * np.linalg.norm(embedding) + 1e-8
-                )
-                similarities.append((word, similarity))
+                target_norm = np.linalg.norm(target_embedding)
+                embedding_norm = np.linalg.norm(embedding)
+                
+                if target_norm > 1e-8 and embedding_norm > 1e-8:
+                    similarity = np.dot(target_embedding, embedding) / (target_norm * embedding_norm)
+                    similarities.append((word, similarity))
         
         similarities.sort(key=lambda x: x[1], reverse=True)
         return similarities[:top_k]
@@ -357,8 +358,12 @@ class AttentionBasedNewsFactorModel:
         if not sample_keywords:
             return {}
         
-        keyword_embedding_layer = self.model.get_layer('impact_aware_keyword_embeddings')
-        all_embeddings = keyword_embedding_layer.get_weights()[0]
+        try:
+            keyword_embedding_layer = self.model.get_layer('keyword_embeddings')
+            all_embeddings = keyword_embedding_layer.get_weights()[0]
+        except ValueError:
+            logger.warning("Keyword embedding layer not found")
+            return {}
         
         valid_keywords = []
         embeddings = []
@@ -376,9 +381,8 @@ class AttentionBasedNewsFactorModel:
         embeddings = np.array(embeddings)
         
         # Compute similarity matrix
-        similarity_matrix = np.dot(embeddings, embeddings.T) / (
-            np.linalg.norm(embeddings, axis=1)[:, None] * np.linalg.norm(embeddings, axis=1)[None, :] + 1e-8
-        )
+        normalized_embeddings = embeddings / np.maximum(np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-8) 
+        similarity_matrix = np.dot(normalized_embeddings, normalized_embeddings.T)
         
         # Find clusters of similar-impact keywords
         clusters = {}

@@ -1,0 +1,14 @@
+numpy
+nltk
+pandas
+matplotlib
+seaborn
+scikit-learn
+transformers
+torch
+jupyterlab
+ipywidgets
+plotly
+mlflow
+tensorflow-addons
+protobuf<4

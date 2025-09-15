@@ -92,4 +92,8 @@ class ImprovedTokenizer:
         else:
             tokens.extend([self.word_to_idx['[PAD]']] * (max_length - len(tokens)))
         
-        return np.array(tokens)
+        tokens = np.array(tokens)
+        if tokens.ndim == 1:
+            tokens = tokens.reshape(1, -1)
+
+        return tokens

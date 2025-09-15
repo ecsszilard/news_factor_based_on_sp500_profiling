@@ -4,9 +4,6 @@ import tensorflow as tf
 from transformers import AutoTokenizer, AutoModel
 import torch
 import logging
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-
 
 logger = logging.getLogger("AdvancedNewsFactor.CompanyEmbeddingSystem")
 

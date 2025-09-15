@@ -2,14 +2,16 @@ import numpy as np
 import pandas as pd
 import time
 import logging
+import mlflow
 
 from CompanyEmbeddingSystem import CompanyEmbeddingSystem
 from AttentionBasedNewsFactorModel import AttentionBasedNewsFactorModel
 from NewsDataProcessor import NewsDataProcessor
 from AdvancedTradingSystem import AdvancedTradingSystem
 from PerformanceAnalyzer import PerformanceAnalyzer
+from ImprovedTokenizer import ImprovedTokenizer
 
-# Logging beállítások
+# Logging settings
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,19 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger("AdvancedNewsFactor")
 
 def create_sample_data():
-    """
-    Minta adatok létrehozása a rendszer tesztelésére
-    """
-    # Minta cégadatok
-    companies_data = pd.DataFrame({
+    """Creating sample data to test the system"""
+
+    sample_companies = pd.DataFrame({
         'symbol': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
-        'name': ['Apple Inc.', 'Microsoft Corporation', 'Alphabet Inc.', 
-                'Amazon.com Inc.', 'Tesla Inc.'],
-        'sector': ['Technology', 'Technology', 'Technology', 
-                  'Consumer Discretionary', 'Consumer Discretionary']
+        'name': ['Apple Inc.', 'Microsoft Corporation', 'Alphabet Inc.', 'Amazon.com Inc.', 'Tesla Inc.'],
+        'sector': ['Technology', 'Technology', 'Technology', 'Consumer Discretionary', 'Consumer Discretionary']
     })
     
-    # Minta hírek
     sample_news = [
         {
             'text': 'Apple announces record quarterly earnings with strong iPhone sales and services growth',
@@ -52,9 +49,8 @@ def create_sample_data():
         }
     ]
     
-    # Minta árfolyamadatok
     sample_prices = {}
-    for company in companies_data['symbol']:
+    for company in sample_companies['symbol']:
         prices = {}
         base_price = 100 + np.random.rand() * 200  # 100-300 közötti alapár
         
@@ -67,7 +63,7 @@ def create_sample_data():
         
         sample_prices[company] = prices
     
-    return companies_data, sample_news, sample_prices
+    return sample_companies, sample_news, sample_prices
 
 if __name__ == "__main__":
     logger.info("Fejlett hírfaktor-elemző kereskedési rendszer indítása...")
@@ -77,11 +73,12 @@ if __name__ == "__main__":
     companies_df.to_csv('sp500_companies.csv', index=False)
     
     company_system = CompanyEmbeddingSystem('sp500_companies.csv')
-    news_model = AttentionBasedNewsFactorModel(company_system)
+    tokenizer = ImprovedTokenizer(vocab_size=50000)
+    news_model = AttentionBasedNewsFactorModel(company_system, tokenizer)
     
     # Build vocabulary
     all_news_texts = [news['text'] for news in sample_news]
-    news_model.build_vocabulary(all_news_texts)
+    tokenizer.build_vocab(all_news_texts)
 
     # Store static company features (used for initialization/analysis)
     for _, company_row in companies_df.iterrows():
@@ -149,7 +146,6 @@ if __name__ == "__main__":
             for word, similarity in similar_keywords:
                 print(f"  {word}: {similarity:.3f}")
     
-    
     # Create trading system
     trading_system = AdvancedTradingSystem(company_system, news_model)
     
@@ -173,12 +169,10 @@ if __name__ == "__main__":
         print(f"  Similar Companies: {[comp[0] for comp in analysis['similar_companies'][:2]]}")
     
     # Generate and execute trading signals
-    trading_signals = trading_system.generate_trading_signals(news_impact, 
-                                                            relevance_threshold=0.3, 
-                                                            confidence_threshold=0.3)
+    trading_signals = trading_system.generate_trading_signals(news_impact, relevance_threshold=0.3, confidence_threshold=0.3)
     executed_trades = trading_system.execute_trades(trading_signals)
     
-    # 11. Teljesítmény elemzése
+    # Performance analysis
     performance_analyzer = PerformanceAnalyzer(trading_system)
     performance_report = performance_analyzer.generate_performance_report('improved_performance_report.json')
     
@@ -187,7 +181,7 @@ if __name__ == "__main__":
     logger.info(f"Aktív pozíciók: {performance_report['active_positions']}")
     logger.info(f"Összes kereskedés: {performance_report['total_trades']}")
     
-    # 12. Modellek mentése
+    # Saving models
     trading_system.save_model_and_data('improved_models')
     
     logger.info("Rendszer futása sikeres!")
