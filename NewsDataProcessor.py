@@ -12,7 +12,7 @@ class NewsDataProcessor:
         self.news_model = news_model
         self.processed_news = []
         
-        logger.info("NewsDataProcessor inicializálva")
+        logger.info("NewsDataProcessor initialized")
     
     def process_news_batch(self, news_data, price_data):
         """Prepare multi-task training data"""
@@ -31,6 +31,7 @@ class NewsDataProcessor:
             news_timestamp = news_item['timestamp']
             
             keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+            
             news_targets = self.company_system.get_bert_embedding(news_text)[:getattr(self.news_model, 'latent_dim', 128)]
             
             for company in affected_companies:
@@ -84,7 +85,7 @@ class NewsDataProcessor:
             # We are looking for a price for the period days later.
             target_timestamp = news_timestamp + (period * 24 * 3600)  # seconds
             
-            # Legközelebbi ár keresése
+            # Find closest price
             closest_price = None
             min_time_diff = float('inf')
             
@@ -153,5 +154,5 @@ class NewsDataProcessor:
             return np.array([vol_change, volume_change])
             
         except Exception as e:
-            logger.warning(f"Volatilitás számítási hiba: {str(e)}")
+            logger.warning(f"Volatility calculation error: {str(e)}")
             return np.array([0.0, 0.0])
