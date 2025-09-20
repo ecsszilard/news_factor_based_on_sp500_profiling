@@ -30,7 +30,7 @@ class AdvancedTradingSystem:
     def get_similar_companies_by_news_response(self, target_company, top_k=5):
         return self._get_similar_items(
             target_key=target_company,
-            idx_lookup={c: i for i, c in self.company_system.idx_to_company.items()},
+            idx_lookup=self.company_system.company_to_idx,
             name_lookup=self.company_system.idx_to_company,
             embedding_layer_name="company_embeddings",
             top_k=top_k
@@ -39,8 +39,8 @@ class AdvancedTradingSystem:
     def get_similar_keywords_by_impact(self, target_word, top_k=10):
         return self._get_similar_items(
             target_key=target_word,
-            idx_lookup=self.tokenizer.word_to_idx,
-            name_lookup=self.tokenizer.word_to_idx,
+            idx_lookup=self.news_model.tokenizer.word_to_idx,
+            name_lookup={v: k for k, v in self.news_model.tokenizer.word_to_idx.items()},
             embedding_layer_name="keyword_embeddings", # Shape: (vocab_size, keyword_dim)
             top_k=top_k,
             invalid_tokens={'[PAD]', '[UNK]', '[CLS]', '[SEP]'}
@@ -71,7 +71,7 @@ class AdvancedTradingSystem:
         if target_norm <= 1e-8:
             return []
 
-        for item, idx in name_lookup.items():
+        for idx, item in name_lookup.items():
             if idx == target_idx or idx >= len(all_embeddings):
                 continue
             if invalid_tokens and item in invalid_tokens:

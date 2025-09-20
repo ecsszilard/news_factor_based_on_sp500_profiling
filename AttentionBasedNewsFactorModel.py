@@ -12,21 +12,30 @@ callbacks = tf.keras.callbacks
 metrics = tf.keras.metrics
 
 class F1Score(metrics.Metric):
-    def __init__(self, num_classes=2, average='macro', **kwargs):
+    def __init__(self, threshold=0.5, **kwargs):
         super().__init__(**kwargs)
-        self.num_classes = num_classes
-        self.average = average
-        self.precision = metrics.Precision()
-        self.recall = metrics.Recall()
+        self.threshold = threshold
+        self.true_positives = self.add_weight(name='tp', initializer='zeros')
+        self.predicted_positives = self.add_weight(name='pp', initializer='zeros')
+        self.actual_positives = self.add_weight(name='ap', initializer='zeros')
     
     def update_state(self, y_true, y_pred, sample_weight=None):
-        self.precision.update_state(y_true, y_pred, sample_weight)
-        self.recall.update_state(y_true, y_pred, sample_weight)
+        y_pred = tf.cast(y_pred > self.threshold, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+        
+        self.true_positives.assign_add(tf.reduce_sum(y_true * y_pred))
+        self.predicted_positives.assign_add(tf.reduce_sum(y_pred))
+        self.actual_positives.assign_add(tf.reduce_sum(y_true))
     
     def result(self):
-        p = self.precision.result()
-        r = self.recall.result()
-        return 2 * ((p * r) / (p + r + 1e-7))
+        precision = self.true_positives / (self.predicted_positives + 1e-7)
+        recall = self.true_positives / (self.actual_positives + 1e-7)
+        return 2 * ((precision * recall) / (precision + recall + 1e-7))
+    
+    def reset_state(self):
+        self.true_positives.assign(0)
+        self.predicted_positives.assign(0)
+        self.actual_positives.assign(0)
     
 class OptimizedAttentionLayer(layers.Layer):
     def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
@@ -109,7 +118,7 @@ class AttentionBasedNewsFactorModel:
             metrics={
                 'price_change_prediction': ['mae'],
                 'volatility_prediction': ['mae'],
-                'relevance_prediction':  ['accuracy', F1Score(num_classes=2, average='macro')],
+                'relevance_prediction': ['accuracy', F1Score()],
                 'news_reconstruction': ['mae'],
                 'attention_regularization': ['accuracy']
             }
@@ -293,12 +302,12 @@ class AttentionBasedNewsFactorModel:
                         for metric, value in logs.items():
                             mlflow.log_metric(metric, value, step=epoch)
 
-            X_keywords = np.array(training_data['keywords'])
+            X_keywords = np.squeeze(np.array(training_data['keywords']), axis=1)
             X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
             
             y_price_changes = np.array(training_data['price_changes'])
             y_volatility_changes = np.array(training_data['volatility_changes'])
-            y_relevance = np.array(training_data['relevance_labels'])
+            y_relevance = np.expand_dims(np.array(training_data['relevance_labels']), -1)  # Shape fix for binary classification
             y_news_targets = np.array(training_data['news_targets'])
             
             # Create attention regularization targets (uniform distribution encourages diverse attention)
@@ -310,7 +319,7 @@ class AttentionBasedNewsFactorModel:
                 val_X_company_indices = np.array(validation_data['company_indices']).reshape(-1, 1)
                 val_y_price_changes = np.array(validation_data['price_changes'])
                 val_y_volatility_changes = np.array(validation_data['volatility_changes'])
-                val_y_relevance = np.array(validation_data['relevance_labels'])
+                val_y_relevance = np.expand_dims(np.array(validation_data['relevance_labels']), -1)  # Shape fix for binary classification
                 val_y_news_targets = np.array(validation_data['news_targets'])
                 val_y_attention_reg = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
                 
@@ -346,10 +355,7 @@ class AttentionBasedNewsFactorModel:
             
             mlflow.tensorflow.log_model(
                 self.model, 
-                "news_factor_model",
-                signature=mlflow.models.infer_signature(
-                    [training_data['keywords'][:5], training_data['company_indices'][:5]]
-                )
+                "news_factor_model"
             )
             
             # Log performance metrics
