@@ -25,7 +25,7 @@ RUN jupyter notebook --generate-config && \
     echo "c.NotebookApp.token = ''" >> ~/.jupyter/jupyter_notebook_config.py
 
 # Expose ports for Jupyter and TensorBoard
-EXPOSE 8888 6006
+EXPOSE 8888 6006 5000
 
 # Default command: start Jupyter
 CMD ["jupyter", "notebook", "--notebook-dir=/app", "--ip=0.0.0.0", "--allow-root", "--no-browser"]

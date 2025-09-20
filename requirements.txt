@@ -10,5 +10,4 @@ jupyterlab
 ipywidgets
 plotly
 mlflow
-tensorflow-addons
-protobuf<4
+protobuf>=3.19.0,<5.0.0

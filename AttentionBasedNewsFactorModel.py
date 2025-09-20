@@ -1,7 +1,7 @@
 import logging
 import numpy as np
 import tensorflow as tf
-import tensorflow_addons as tfa
+import mlflow
 
 logger = logging.getLogger("AdvancedNewsFactor.AttentionBasedNewsFactorModel")
 layers = tf.keras.layers
@@ -9,6 +9,57 @@ models = tf.keras.models
 optimizers = tf.keras.optimizers
 regularizers = tf.keras.regularizers
 callbacks = tf.keras.callbacks
+metrics = tf.keras.metrics
+
+class F1Score(tf.keras.metrics.Metric):
+    def __init__(self, num_classes=2, average='macro', **kwargs):
+        super().__init__(**kwargs)
+        self.num_classes = num_classes
+        self.average = average
+        self.precision = metrics.Precision()
+        self.recall = metrics.Recall()
+    
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        self.precision.update_state(y_true, y_pred, sample_weight)
+        self.recall.update_state(y_true, y_pred, sample_weight)
+    
+    def result(self):
+        p = self.precision.result()
+        r = self.recall.result()
+        return 2 * ((p * r) / (p + r + 1e-7))
+    
+class OptimizedAttentionLayer(tf.keras.layers.Layer):
+    def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.dropout_rate = dropout_rate
+        
+        # Scaled attention with learnable temperature
+        self.temperature = self.add_weight(
+            shape=(), initializer='ones', trainable=True, name='temperature'
+        )
+        
+    def build(self, input_shape):
+        self.attention = tf.keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.key_dim,
+            dropout=self.dropout_rate
+        )
+        self.layer_norm = tf.keras.layers.LayerNormalization()
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+    
+    def call(self, query, key, value, training=None):
+        # Temperature scaled attention
+        attention_output = self.attention(
+            query, key, value, training=training
+        )
+        attention_output = attention_output * self.temperature
+        
+        # Residual connection with layer norm
+        output = self.layer_norm(query + self.dropout(attention_output, training=training))
+        return output
 
 class AttentionBasedNewsFactorModel:
     """Multi-task learning model for news sentiment analysis with shared company embeddings"""
@@ -21,44 +72,57 @@ class AttentionBasedNewsFactorModel:
         self.max_keywords = max_keywords
         self.tokenizer = tokenizer
 
+        mlflow.set_tracking_uri("sqlite:///mlflow.db")
+        mlflow.set_experiment("news_factor_trading")
+        
         self.model = self.build_model()
         
-        # BERT optimizer, but it is worth considering LAMB for a lot of news
-        optimizer = optimizers.Adam(
-            learning_rate=optimizers.schedules.CosineDecayRestarts(
-                initial_learning_rate=0.1,
+        # Custom optimizer with gradient clipping
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=tf.keras.optimizers.schedules.CosineDecayRestarts(
+                initial_learning_rate=1e-3,
                 first_decay_steps=1000,
                 t_mul=2.0,
-                m_mul=1.0,
-                alpha=0.0
-            )
+                m_mul=0.9,
+                alpha=0.1
+            ),
+            weight_decay=1e-4,
+            clipnorm=1.0  # Gradient clipping
         )
         
         self.model.compile(
             optimizer=optimizer,
             loss={
-                'price_change_prediction': 'mse',
+                'price_change_prediction': self._huber_loss,
                 'volatility_prediction': 'mse',
                 'relevance_prediction': 'binary_crossentropy',
-                'news_reconstruction': 'mse',
+                'news_reconstruction': 'mae',
                 'attention_regularization': 'categorical_crossentropy'  # Added back
             },
             loss_weights={
-                'price_change_prediction': 2.0,  # Main task
-                'volatility_prediction': 1.5,
-                'relevance_prediction': 1.0,
-                'news_reconstruction': 0.3,
-                'attention_regularization': 0.2  # Encourages meaningful attention patterns
+                'price_change_prediction': 3.0,  # Main task
+                'volatility_prediction': 2.0,
+                'relevance_prediction': 1.5,
+                'news_reconstruction': 0.5,
+                'attention_regularization': 0.3  # Encourages meaningful attention patterns
             },
             metrics={
                 'price_change_prediction': ['mae'],
                 'volatility_prediction': ['mae'],
-                'relevance_prediction':  ['accuracy', tfa.metrics.F1Score(num_classes=2, average='macro')],
+                'relevance_prediction':  ['accuracy', F1Score(num_classes=2, average='macro')],
                 'news_reconstruction': ['mae'],
                 'attention_regularization': ['accuracy']
             }
         )
 
+    def _huber_loss(self, y_true, y_pred, delta=1.0):
+        """Robust Huber loss for price predictions"""
+        error = y_true - y_pred
+        condition = tf.abs(error) <= delta
+        squared_loss = 0.5 * tf.square(error)
+        linear_loss = delta * tf.abs(error) - 0.5 * tf.square(delta)
+        return tf.where(condition, squared_loss, linear_loss)
+    
     def build_model(self):
         """Multi-task model with shared company embeddings.
         Combines global context informativeness with local keyword relevance via attention and reconstruction."""
@@ -80,10 +144,10 @@ class AttentionBasedNewsFactorModel:
             name='keyword_embeddings'
         )(keyword_input) # These learn impact patterns
 
-        attn_keywords = layers.MultiHeadAttention(
+        attn_keywords = OptimizedAttentionLayer(
             num_heads=8,
             key_dim=self.keyword_dim // 8,
-            dropout=0.1,
+            dropout_rate=0.1,
             name='keyword_attention'
         )(keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
 
@@ -120,8 +184,7 @@ class AttentionBasedNewsFactorModel:
         company_proc = layers.Dropout(0.1)(company_proc)
         company_reshaped = layers.Reshape((1, self.latent_dim))(company_proc)
 
-        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein, ha többdimenziós cégháló-struktúrát 
-        # (pl. szektor, beszállítói lánc) akarunk modellezni, ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
+        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein, ha többdimenziós cégháló-struktúrát (pl. szektor, beszállítói lánc) akarunk modellezni, ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
 
         # -----------------------------
         # 4. Bi-directional attention
@@ -212,146 +275,93 @@ class AttentionBasedNewsFactorModel:
     
     def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
         """Train the multi-task model"""
-        X_keywords = np.array(training_data['keywords'])
-        X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
-        
-        y_price_changes = np.array(training_data['price_changes'])
-        y_volatility_changes = np.array(training_data['volatility_changes'])
-        y_relevance = np.array(training_data['relevance_labels'])
-        y_news_targets = np.array(training_data['news_targets'])
-        
-        # Create attention regularization targets (uniform distribution encourages diverse attention)
-        y_attention_reg = np.ones((len(X_keywords), self.max_keywords)) / self.max_keywords
-        
-        validation_data_prepared = None
-        if validation_data:
-            val_X_keywords = np.array(validation_data['keywords'])
-            val_X_company_indices = np.array(validation_data['company_indices']).reshape(-1, 1)
-            val_y_price_changes = np.array(validation_data['price_changes'])
-            val_y_volatility_changes = np.array(validation_data['volatility_changes'])
-            val_y_relevance = np.array(validation_data['relevance_labels'])
-            val_y_news_targets = np.array(validation_data['news_targets'])
-            val_y_attention_reg = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
+        with mlflow.start_run():
+            # Log hyperparameters
+            mlflow.log_params({
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'keyword_dim': self.keyword_dim,
+                'company_dim': self.company_dim,
+                'latent_dim': self.latent_dim,
+                'max_keywords': self.max_keywords
+            })
             
-            validation_data_prepared = (
-                [val_X_keywords, val_X_company_indices],
-                [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
-            )
+            # Custom callback for MLflow logging
+            class MLflowCallback(tf.keras.callbacks.Callback):
+                def on_epoch_end(self, epoch, logs=None):
+                    if logs:
+                        for metric, value in logs.items():
+                            mlflow.log_metric(metric, value, step=epoch)
+            
+            callbacks = [
+                MLflowCallback(),
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss', patience=15, restore_best_weights=True
+                ),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor='val_loss', factor=0.5, patience=8, min_lr=1e-6
+                )
+            ]
+
+            X_keywords = np.array(training_data['keywords'])
+            X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
+            
+            y_price_changes = np.array(training_data['price_changes'])
+            y_volatility_changes = np.array(training_data['volatility_changes'])
+            y_relevance = np.array(training_data['relevance_labels'])
+            y_news_targets = np.array(training_data['news_targets'])
+            
+            # Create attention regularization targets (uniform distribution encourages diverse attention)
+            y_attention_reg = np.ones((len(X_keywords), self.max_keywords)) / self.max_keywords
+            
+            validation_data_prepared = None
+            if validation_data:
+                val_X_keywords = np.array(validation_data['keywords'])
+                val_X_company_indices = np.array(validation_data['company_indices']).reshape(-1, 1)
+                val_y_price_changes = np.array(validation_data['price_changes'])
+                val_y_volatility_changes = np.array(validation_data['volatility_changes'])
+                val_y_relevance = np.array(validation_data['relevance_labels'])
+                val_y_news_targets = np.array(validation_data['news_targets'])
+                val_y_attention_reg = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
+                
+                validation_data_prepared = (
+                    [val_X_keywords, val_X_company_indices],
+                    [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
+                )
+            
+            history = self.model.fit(
+                [X_keywords, X_company_indices],
+                [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
+                validation_data=validation_data_prepared,
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=[
+                    callbacks.EarlyStopping(
+                    monitor='val_loss' if validation_data else 'loss',
+                    patience=15,
+                    restore_best_weights=True),
+                    callbacks.ReduceLROnPlateau(monitor='val_loss' if validation_data else 'loss', factor=0.5, patience=8, min_lr=1e-6)
+                ],
+                verbose=1)
         
-        history = self.model.fit(
-            [X_keywords, X_company_indices],
-            [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
-            validation_data=validation_data_prepared,
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=[
-                callbacks.EarlyStopping(
-                monitor='val_loss' if validation_data else 'loss',
-                patience=15,
-                restore_best_weights=True),
-                callbacks.ReduceLROnPlateau(monitor='val_loss' if validation_data else 'loss', factor=0.5, patience=8, min_lr=1e-6)
-            ],
-            verbose=1)
+            mlflow.tensorflow.log_model(
+                self.model, 
+                "news_factor_model",
+                signature=mlflow.models.infer_signature(
+                    [training_data['keywords'][:5], training_data['company_indices'][:5]]
+                )
+            )
+            
+            # Log performance metrics
+            if validation_data:
+                val_loss = min(history.history['val_loss'])
+                mlflow.log_metric('best_val_loss', val_loss)
         return history
     
     def prepare_keyword_sequence(self, text, max_length=None):
         if max_length is None:
             max_length = self.max_keywords
         return self.tokenizer.encode(text, max_length=max_length)
-    
-    def predict_impact(self, keyword_sequence, company_idx, return_detailed=False):
-        """Predict impact of news on company"""
-        predictions = self.model.predict([keyword_sequence, np.array([[company_idx]])], verbose=0)
-        
-        price_pred = predictions[0][0]  # [1d, 5d, 20d returns]
-        volatility_pred = predictions[1][0]  # [volatility_change, volume_change]
-        relevance_pred = predictions[2][0][0]  # relevance score
-        reconstruction_pred = predictions[3][0]  # news reconstruction
-        
-        if return_detailed:
-            return {
-                'price_changes': {
-                    '1d': price_pred[0],
-                    '5d': price_pred[1],
-                    '20d': price_pred[2]
-                },
-                'volatility_changes': {
-                    'volatility': volatility_pred[0],
-                    'volume_proxy': volatility_pred[1]
-                },
-                'relevance_score': relevance_pred,
-                'reconstruction_quality': np.mean(np.abs(reconstruction_pred)),
-                'company_idx': company_idx,
-                'confidence': relevance_pred  # Use relevance as confidence proxy
-            }
-        else:
-            return price_pred
-    
-    def get_similar_companies_by_news_response(self, target_company, top_k=5):
-        """Find companies with similar news response patterns using learned embeddings"""
-        target_idx = self.company_system.get_company_idx(target_company)
-        
-        # Extract company embeddings from the model
-        try:
-            company_embedding_layer = self.model.get_layer('company_embeddings')
-            all_embeddings = company_embedding_layer.get_weights()[0] # Shape: (num_companies, company_dim)
-        except ValueError:
-            logger.warning("Company embedding layer not found, returning empty list")
-            return []
-        
-        if target_idx >= len(all_embeddings):
-            return []
-        
-        target_embedding = all_embeddings[target_idx]
-        similarities = []
-        
-        for i, embedding in enumerate(all_embeddings):
-            if i != target_idx:
-                target_norm = np.linalg.norm(target_embedding)
-                embedding_norm = np.linalg.norm(embedding)
-                
-                if target_norm > 1e-8 and embedding_norm > 1e-8:
-                    similarity = np.dot(target_embedding, embedding) / (target_norm * embedding_norm)
-                    company_symbol = self.company_system.idx_to_company.get(i, f"UNKNOWN_{i}")
-                    similarities.append((company_symbol, similarity))
-        
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
-    
-    def get_similar_keywords_by_impact(self, target_word, top_k=10):
-        """Find keywords with similar market impact patterns using learned embeddings"""
-        if target_word not in self.tokenizer.word_to_idx:
-            return []
-        
-        target_idx = self.tokenizer.word_to_idx[target_word]
-        
-        # Extract keyword embeddings from the model
-        try:
-            keyword_embedding_layer = self.model.get_layer('keyword_embeddings')
-            all_embeddings = keyword_embedding_layer.get_weights()[0] # Shape: (vocab_size, keyword_dim)
-        except ValueError:
-            logger.warning("Keyword embedding layer not found, returning empty list")
-            return []
-        
-        if target_idx >= len(all_embeddings):
-            return []
-        
-        target_embedding = all_embeddings[target_idx]
-        similarities = []
-        
-        for word, idx in self.tokenizer.word_to_idx.items():
-            if (idx != target_idx and idx < len(all_embeddings) and word not in ['[PAD]', '[UNK]', '[CLS]', '[SEP]']):
-                
-                embedding = all_embeddings[idx]
-                target_norm = np.linalg.norm(target_embedding)
-                embedding_norm = np.linalg.norm(embedding)
-                
-                if target_norm > 1e-8 and embedding_norm > 1e-8:
-                    similarity = np.dot(target_embedding, embedding) / (target_norm * embedding_norm)
-                    similarities.append((word, similarity))
-        
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
     
     def analyze_keyword_impact_clusters(self, sample_keywords, return_matrix=False):
         """Analyze how keywords cluster based on their learned impact patterns"""

@@ -2,19 +2,35 @@ version: '3.8'
 
 services:
   tensorflow-gpu:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    image: tf-news-trading:latest  # Explicit image név
     container_name: tf-gpu-dev
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/app
+      - TF_CPP_MIN_LOG_LEVEL=2
     volumes:
-      - .:/app
+      - .:/app:cached  # Cached mount a jobb performance-ért
       - jupyter_data:/root/.jupyter
+      - model_cache:/app/models  # Model cache volume
     ports:
       - "8888:8888"   # Jupyter
       - "6006:6006"   # TensorBoard
+      - "5000:5000"   # MLflow
     stdin_open: true
     tty: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   jupyter_data:
+  model_cache:
