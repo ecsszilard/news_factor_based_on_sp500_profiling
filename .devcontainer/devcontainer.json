@@ -1,9 +1,7 @@
 {
   "name": "TF GPU Dev",
-  "build": {
-    "dockerfile": "../Dockerfile",
-    "context": ".."
-  },
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "news-factor-analyzer",
   "runArgs": [
     "--gpus", "all",
     "--shm-size=2g",

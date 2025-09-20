@@ -18,11 +18,16 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Configure Jupyter Notebook
+# Configure Jupyter Notebook + install Node.js for VS Code Remote
 RUN jupyter notebook --generate-config && \
     echo "c.NotebookApp.ip = '0.0.0.0'" >> ~/.jupyter/jupyter_notebook_config.py && \
     echo "c.NotebookApp.allow_root = True" >> ~/.jupyter/jupyter_notebook_config.py && \
-    echo "c.NotebookApp.token = ''" >> ~/.jupyter/jupyter_notebook_config.py
+    echo "c.NotebookApp.token = ''" >> ~/.jupyter/jupyter_notebook_config.py && \
+    apt-get update && \
+    apt-get install -y curl && \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # Expose ports for Jupyter and TensorBoard
 EXPOSE 8888 6006 5000

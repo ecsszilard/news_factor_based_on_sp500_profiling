@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 from transformers import AutoTokenizer, AutoModel
 import torch
 import logging
@@ -27,13 +26,32 @@ class CompanyEmbeddingSystem:
         self.static_features = {}
         self.news_embeddings = []
         self.news_metadata = []
+        
+        # SIMPLE cache for BERT embeddings - ONLY THIS WAS NEEDED!
+        self._bert_cache = {}
     
     def get_bert_embedding(self, text, max_length=512):
+        # Simple cache check - this fixes the memory leak
+        text_key = hash(text.strip().lower())
+        if text_key in self._bert_cache:
+            return self._bert_cache[text_key].copy()
+        
         inputs = self.tokenizer(text, return_tensors='pt', max_length=max_length, truncation=True, padding=True)
         
         with torch.no_grad():
             outputs = self.bert_model(**inputs)
         embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]
+        
+        # Cache the result - prevent recomputation
+        self._bert_cache[text_key] = embedding.copy()
+        
+        # Simple cache size management
+        if len(self._bert_cache) > 1000:
+            # Remove half of the cache when it gets too big
+            keys_to_remove = list(self._bert_cache.keys())[:500]
+            for key in keys_to_remove:
+                del self._bert_cache[key]
+        
         return embedding
     
     def store_static_features(self, symbol, fundamental_data=None, price_data=None, sector_info=None):

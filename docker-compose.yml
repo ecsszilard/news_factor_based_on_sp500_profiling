@@ -1,13 +1,12 @@
 version: '3.8'
 
 services:
-  tensorflow-gpu:
+  news-factor-analyzer:
     build: 
       context: .
       dockerfile: Dockerfile
-    image: tf-news-trading:latest  # Explicit image név
+    image: tf-news-trading:latest
     container_name: tf-gpu-dev
-    runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - PYTHONPATH=/app
@@ -15,7 +14,7 @@ services:
     volumes:
       - .:/app:cached  # Cached mount a jobb performance-ért
       - jupyter_data:/root/.jupyter
-      - model_cache:/app/models  # Model cache volume
+      - model_cache:/app/models
     ports:
       - "8888:8888"   # Jupyter
       - "6006:6006"   # TensorBoard

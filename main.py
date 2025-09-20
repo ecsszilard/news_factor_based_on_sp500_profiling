@@ -28,10 +28,10 @@ def create_sample_data():
         'symbol': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'F', 'GM', 'JPM', 'NFLX'],
         'name': ['Apple Inc.', 'Microsoft Corporation', 'Alphabet Inc.', 'Amazon.com Inc.', 
                 'Tesla Inc.', 'NVIDIA Corporation', 'Meta Platforms Inc.', 'Ford Motor Company',
-                'General Motors Company', 'JPMorgan Chase & Co.'],
+                'General Motors Company', 'JPMorgan Chase & Co.', 'Netflix Inc.'],
         'sector': ['Technology', 'Technology', 'Technology', 'Consumer Discretionary', 
                   'Consumer Discretionary', 'Technology', 'Technology', 'Consumer Discretionary',
-                  'Consumer Discretionary', 'Financials', 'Streaming']
+                  'Consumer Discretionary', 'Financials', 'Communication Services']
     })
     
     sample_news = [
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         print("Training completed!")
 
     # --- Test news impact ---
-    test_news = "Tesla reports breakthrough in battery technology..."
+    test_news = "Tesla reports breakthrough in battery technology, expects 50% cost reduction"
     target_companies = ["TSLA", "AAPL", "F", "GM", "NVDA"]
 
     print(f"\nAnalyzing news: {test_news}")
@@ -238,7 +238,10 @@ if __name__ == "__main__":
           f"Positions={div.get('num_positions',0)}")
 
     report = PerformanceAnalyzer(trading_system).generate_performance_report("improved_performance_report.json")
-    logger.info(f"Performance Report: {report}")
+    logger.info(f"Portfolio Value: ${report['portfolio_value']:.2f}")
+    logger.info(f"Active Positions: {report['active_positions']}")
+    logger.info(f"Total Trades: {report['total_trades']}")
+    
     trading_system.save_model_and_data("improved_models")
 
     print("✅ System executed successfully!")

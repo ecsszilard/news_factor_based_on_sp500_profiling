@@ -11,7 +11,7 @@ regularizers = tf.keras.regularizers
 callbacks = tf.keras.callbacks
 metrics = tf.keras.metrics
 
-class F1Score(tf.keras.metrics.Metric):
+class F1Score(metrics.Metric):
     def __init__(self, num_classes=2, average='macro', **kwargs):
         super().__init__(**kwargs)
         self.num_classes = num_classes
@@ -28,7 +28,7 @@ class F1Score(tf.keras.metrics.Metric):
         r = self.recall.result()
         return 2 * ((p * r) / (p + r + 1e-7))
     
-class OptimizedAttentionLayer(tf.keras.layers.Layer):
+class OptimizedAttentionLayer(layers.Layer):
     def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
         super().__init__(**kwargs)
         self.num_heads = num_heads
@@ -41,13 +41,13 @@ class OptimizedAttentionLayer(tf.keras.layers.Layer):
         )
         
     def build(self, input_shape):
-        self.attention = tf.keras.layers.MultiHeadAttention(
+        self.attention = layers.MultiHeadAttention(
             num_heads=self.num_heads,
             key_dim=self.key_dim,
             dropout=self.dropout_rate
         )
-        self.layer_norm = tf.keras.layers.LayerNormalization()
-        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        self.layer_norm = layers.LayerNormalization()
+        self.dropout = layers.Dropout(self.dropout_rate)
         super().build(input_shape)
     
     def call(self, query, key, value, training=None):
@@ -78,8 +78,8 @@ class AttentionBasedNewsFactorModel:
         self.model = self.build_model()
         
         # Custom optimizer with gradient clipping
-        optimizer = tf.keras.optimizers.AdamW(
-            learning_rate=tf.keras.optimizers.schedules.CosineDecayRestarts(
+        optimizer = optimizers.AdamW(
+            learning_rate=optimizers.schedules.CosineDecayRestarts(
                 initial_learning_rate=1e-3,
                 first_decay_steps=1000,
                 t_mul=2.0,
@@ -149,7 +149,7 @@ class AttentionBasedNewsFactorModel:
             key_dim=self.keyword_dim // 8,
             dropout_rate=0.1,
             name='keyword_attention'
-        )(keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
+        )(keyword_embedding, keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
 
         keyword_latent = layers.Dense(
             self.latent_dim,
@@ -287,21 +287,11 @@ class AttentionBasedNewsFactorModel:
             })
             
             # Custom callback for MLflow logging
-            class MLflowCallback(tf.keras.callbacks.Callback):
+            class MLflowCallback(callbacks.Callback):
                 def on_epoch_end(self, epoch, logs=None):
                     if logs:
                         for metric, value in logs.items():
                             mlflow.log_metric(metric, value, step=epoch)
-            
-            callbacks = [
-                MLflowCallback(),
-                tf.keras.callbacks.EarlyStopping(
-                    monitor='val_loss', patience=15, restore_best_weights=True
-                ),
-                tf.keras.callbacks.ReduceLROnPlateau(
-                    monitor='val_loss', factor=0.5, patience=8, min_lr=1e-6
-                )
-            ]
 
             X_keywords = np.array(training_data['keywords'])
             X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
@@ -329,21 +319,31 @@ class AttentionBasedNewsFactorModel:
                     [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
                 )
             
+            callback_list = [
+                callbacks.EarlyStopping(
+                    monitor='val_loss' if validation_data else 'loss',
+                    patience=15,
+                    restore_best_weights=True
+                ),
+                callbacks.ReduceLROnPlateau(
+                    monitor='val_loss' if validation_data else 'loss',
+                    factor=0.5,
+                    patience=8,
+                    min_lr=1e-6
+                ),
+                MLflowCallback()
+            ]
+            
             history = self.model.fit(
                 [X_keywords, X_company_indices],
                 [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
                 validation_data=validation_data_prepared,
                 epochs=epochs,
                 batch_size=batch_size,
-                callbacks=[
-                    callbacks.EarlyStopping(
-                    monitor='val_loss' if validation_data else 'loss',
-                    patience=15,
-                    restore_best_weights=True),
-                    callbacks.ReduceLROnPlateau(monitor='val_loss' if validation_data else 'loss', factor=0.5, patience=8, min_lr=1e-6)
-                ],
-                verbose=1)
-        
+                callbacks=callback_list,
+                verbose=1
+            )
+            
             mlflow.tensorflow.log_model(
                 self.model, 
                 "news_factor_model",
