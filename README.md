@@ -74,7 +74,6 @@ advanced-news-trading-system/
 │   └── devcontainer.json
 ├── AdvancedTradingSystem.py
 ├── AttentionBasedNewsFactorModel.py
-├── BiDirectionalAttentionLayer.py
 ├── CompanyEmbeddingSystem.py
 ├── ImprovedTokenizer.py
 ├── NewsDataProcessor.py
@@ -129,8 +128,7 @@ for gpu in gpus:
 
 ### Core Models
 - **AttentionBasedNewsFactorModel**: Multi-task neural network with attention mechanisms  
-- **CompanyEmbeddingSystem**: Learns company representations based on news reactions  
-- **BiDirectionalAttentionLayer**: Custom attention layer for news-company interactions  
+- **CompanyEmbeddingSystem**: Learns company representations based on news reactions
 
 ### Data Processing
 - **ImprovedTokenizer**: Advanced tokenization with BERT-like preprocessing  
