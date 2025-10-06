@@ -8,7 +8,7 @@ import os
 logger = logging.getLogger("AdvancedNewsFactor.AdvancedTradingSystem")
 
 class AdvancedTradingSystem:
-    """Trading system using multi-task learned company embeddings"""
+    """Trading system using correlation-based news factor model"""
 
     def __init__(self, company_embedding_system, news_factor_model):
         self.company_system = company_embedding_system
@@ -127,36 +127,117 @@ class AdvancedTradingSystem:
             return self.correlation_matrix[company2].get(company1, 0.0)
         return 0.0
     
-    def generate_trading_signals(self, news_analysis, relevance_threshold=0.6, confidence_threshold=0.5):
-        """Generate trading signals based on multi-task predictions"""
+    def analyze_news_impact(self, news_text, target_companies=None, correlation_threshold=0.1):
+        """Analyze news impact using correlation change predictions"""
+        if target_companies is None:
+            target_companies = self.company_system.companies[:10]  # Limit to first 10 for efficiency
+        
+        news_analysis = {}
+        keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+        # If no specific company, use the first one as context
+        company_idx = self.company_system.get_company_idx(target_companies[0] if target_companies else 0)
+        # Get correlation change predictions for the news
+        predictions = self.news_model.model.predict(
+            [keyword_sequence, np.array([[company_idx]])],
+            verbose=0
+        )
+        
+        correlation_changes = predictions[0][0]  # [N, N]
+        price_deviations = predictions[1][0]     # [N]
+        
+        for company in target_companies:
+            company_idx = self.company_system.get_company_idx(company)
+            if company_idx >= len(correlation_changes):
+                continue
+            
+            # Analyze how this company's correlations are expected to change
+            company_correlation_changes = correlation_changes[company_idx, :]
+            
+            # Calculate impact metrics
+            max_correlation_change = np.max(np.abs(company_correlation_changes))
+            mean_correlation_change = np.mean(company_correlation_changes)
+            
+            # Find most affected correlations
+            significant_changes = []
+            for other_idx, corr_change in enumerate(company_correlation_changes):
+                if abs(corr_change) > correlation_threshold and other_idx < len(self.company_system.companies):
+                    other_company = self.company_system.companies[other_idx]
+                    significant_changes.append((other_company, corr_change))
+            
+            significant_changes.sort(key=lambda x: abs(x[1]), reverse=True)
+            
+            # Calculate trading signal strength based on correlation disruption
+            signal_strength = min(max_correlation_change * 5.0, 1.0)
+            # Determine direction based on correlation changes
+            # Positive mean change suggests the company will become more correlated with the market
+            # Negative mean change suggests it will become more independent
+            predicted_direction = 1.0 if mean_correlation_change > 0 else -1.0
+            
+            # Adding price deviation to the prediction
+            price_dev = price_deviations[company_idx] if company_idx < len(price_deviations) else 0.0
+            
+            news_analysis[company] = {
+                'confidence': signal_strength, # Use correlation change magnitude as confidence
+                'predicted_changes': {
+                    '1d': predicted_direction * signal_strength * 0.02 + price_dev * 0.5,
+                    '5d': predicted_direction * signal_strength * 0.05 + price_dev * 1.0,
+                    '20d': predicted_direction * signal_strength * 0.10 + price_dev * 2.0
+                },
+                'volatility_impact': {
+                    'volatility': max_correlation_change,  # High correlation change = high volatility
+                    'volume_proxy': max_correlation_change * 0.5
+                },
+                'correlation_impact': {
+                    'max_change': max_correlation_change,
+                    'mean_change': mean_correlation_change,
+                    'significant_pairs': significant_changes[:5]
+                },
+                'price_deviation': price_dev,
+                'similar_companies': self.get_similar_companies_by_news_response(company, 3),
+                'reconstruction_quality': np.mean(np.abs(predictions[2][0]))
+            }
+        
+        return news_analysis
+    
+    def generate_trading_signals(self, news_analysis, confidence_threshold=0.3):
+        """Generate trading signals based on correlation change predictions"""
         signals = []
         
         for company, analysis in news_analysis.items():
-            relevance = analysis['relevance_score']
-            prediction_1d = analysis['predicted_changes']['1d']
             confidence = analysis['confidence']
+            correlation_impact = analysis.get('correlation_impact', {})
             
-            # Filter by relevance and confidence
-            if relevance < relevance_threshold or confidence < confidence_threshold:
+            # Filter by confidence only (nincs külön relevance)
+            if confidence < confidence_threshold:
                 continue
             
-            # Determine signal type and strength
-            if prediction_1d > 0.01:  # >1% expected increase
-                signal_type = 'BUY'
-                strength = min(prediction_1d * 10, 1.0)
-            elif prediction_1d < -0.01:  # >1% expected decrease
-                signal_type = 'SELL'
-                strength = min(abs(prediction_1d) * 10, 1.0)
-            else:
-                continue  # Neutral, no signal
+            # Determine signal type based on correlation changes
+            max_correlation_change = correlation_impact.get('max_change', 0)
+            mean_correlation_change = correlation_impact.get('mean_change', 0)
             
-            # Calculate position size based on multiple factors
+            # High correlation change suggests volatility opportunity
+            if max_correlation_change > 0.15:  # Significant correlation disruption
+                if mean_correlation_change > 0.05:
+                    # Company becoming more correlated with market - potential momentum play
+                    signal_type = 'BUY'
+                    strength = min(max_correlation_change * 3, 1.0)
+                elif mean_correlation_change < -0.05:
+                    # Company becoming less correlated - potential contrarian play
+                    signal_type = 'SELL'
+                    strength = min(max_correlation_change * 3, 1.0)
+                else:
+                    # Neutral correlation change - volatility play
+                    signal_type = 'BUY'  # Default to buy on volatility
+                    strength = min(max_correlation_change * 2, 0.8)
+            else:
+                continue  # No significant correlation impact
+            
+            # Calculate position size based on confidence and strength
             position_size = (
                 self.portfolio_value * 
                 self.max_position_size * 
                 strength * 
-                confidence * 
-                relevance
+                confidence
             )
             
             signal = {
@@ -164,12 +245,12 @@ class AdvancedTradingSystem:
                 'type': signal_type,
                 'strength': strength,
                 'confidence': confidence,
-                'relevance': relevance,
                 'position_size': position_size,
-                'predicted_change_1d': prediction_1d,
+                'predicted_change_1d': analysis['predicted_changes']['1d'],
                 'predicted_change_5d': analysis['predicted_changes']['5d'],
                 'predicted_change_20d': analysis['predicted_changes']['20d'],
                 'volatility_impact': analysis['volatility_impact']['volatility'],
+                'correlation_impact': correlation_impact,
                 'similar_companies': analysis['similar_companies'],
                 'timestamp': datetime.datetime.now()
             }
@@ -179,8 +260,8 @@ class AdvancedTradingSystem:
         # Apply correlation adjustments
         signals = self.apply_correlation_adjustments(signals)
         
-        # Sort by combined score (strength * confidence * relevance)
-        signals.sort(key=lambda x: x['strength'] * x['confidence'] * x['relevance'], reverse=True)
+        # Sort by combined score (strength * confidence)
+        signals.sort(key=lambda x: x['strength'] * x['confidence'], reverse=True)
         
         return signals
     
@@ -199,9 +280,9 @@ class AdvancedTradingSystem:
                 'type': signal['type'],
                 'size': signal['position_size'],
                 'confidence': signal['confidence'],
-                'relevance': signal['relevance'],
                 'predicted_change': signal['predicted_change_1d'],
                 'correlation_adjustment': signal.get('correlation_adjustment', 1.0),
+                'correlation_impact': signal.get('correlation_impact', {}),
                 'timestamp': signal['timestamp'],
                 'executed': True
             }
@@ -217,17 +298,16 @@ class AdvancedTradingSystem:
             executed_trades.append(trade)
             self.trade_history.append(trade)
             
-            logger.info(f"Trade executed: {signal['type']} {signal['company']} "
-                       f"${signal['position_size']:.2f} (corr_adj: {signal.get('correlation_adjustment', 1.0):.2f})")
+            logger.info(f"Trade executed: {signal['type']} {signal['company']} " f"${signal['position_size']:.2f} (corr_impact: {signal.get('correlation_impact', {}).get('max_change', 0):.3f})")
         
         return executed_trades
     
-    def save_model_and_data(self, path='multi_task_models'):
-        """Save the multi-task model and associated data"""
+    def save_model_and_data(self, path='correlation_models'):
+        """Save the correlation model and associated data"""
         if not os.path.exists(path):
             os.makedirs(path)
         
-        self.news_model.model.save(os.path.join(path, 'multi_task_news_model.h5'))
+        self.news_model.model.save(os.path.join(path, 'correlation_news_model.h5'))
         
         # Save company mapping
         with open(os.path.join(path, 'company_system.pkl'), 'wb') as f:
@@ -252,11 +332,11 @@ class AdvancedTradingSystem:
         
         logger.info(f"Models and data saved: {path}")
         
-    def load_model_and_data(self, path='multi_task_models'):
-        """Load the multi-task model and associated data"""
+    def load_model_and_data(self, path='correlation_models'):
+        """Load the correlation model and associated data"""
         try:
             self.news_model.model = tf.keras.models.load_model(
-                os.path.join(path, 'multi_task_news_model.h5')
+                os.path.join(path, 'correlation_news_model.h5')
             )
             
             with open(os.path.join(path, 'company_system.pkl'), 'rb') as f:

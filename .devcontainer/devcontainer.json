@@ -29,6 +29,6 @@
       }
     }
   },
-  "forwardPorts": [8888, 6006],
+  "forwardPorts": [8888, 6006, 5000],
   "postCreateCommand": "pip install --no-cache-dir -r requirements.txt && python -m nltk.downloader punkt stopwords"
 }

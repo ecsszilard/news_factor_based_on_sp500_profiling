@@ -36,7 +36,7 @@ class F1Score(metrics.Metric):
         self.true_positives.assign(0)
         self.predicted_positives.assign(0)
         self.actual_positives.assign(0)
-    
+
 class OptimizedAttentionLayer(layers.Layer):
     def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
         super().__init__(**kwargs)
@@ -89,16 +89,15 @@ class CompanyAwareKeywordGating(layers.Layer):
         super().build(input_shape)
     
     def call(self, keyword_embeddings, company_embeddings, training=None):
-        # company_embeddings alakja: (batch, 1, latent_dim)
-        company_embeddings = tf.squeeze(company_embeddings, axis=1)  # [batch, 1, latent_dim] -> [batch, latent_dim]
+        company_embeddings = tf.squeeze(company_embeddings, axis=1) # [batch, 1, latent_dim] -> [batch, latent_dim]
         # Generate company-specific gates
-        company_gates = tf.expand_dims(self.gate_generator(company_embeddings), axis=1)     # [batch, 1, latent_dim]
+        company_gates = tf.expand_dims(self.gate_generator(company_embeddings), axis=1) # [batch, 1, latent_dim]
         
-        # The more sensitive a company is, the more it needs to “de-noise” the signal coming from keywords
-        gated_keywords = keyword_embeddings * (1.0 - company_gates)      # [batch, seq_len, latent_dim]
+        # The more sensitive a company is, the more it needs to "de-noise" the signal
+        gated_keywords = keyword_embeddings * (1.0 - company_gates) # [batch, seq_len, latent_dim]
         
         # Calculate keyword importance scores
-        importance_scores = self.importance_scorer(keyword_embeddings)  # [batch, seq_len, 1]
+        importance_scores = self.importance_scorer(keyword_embeddings)
         importance_weights = tf.nn.softmax(importance_scores, axis=1)
         
         # Weighted combination
@@ -106,7 +105,7 @@ class CompanyAwareKeywordGating(layers.Layer):
         return weighted_keywords
 
 class AttentionBasedNewsFactorModel:
-    """Enhanced multi-task learning model with company-keyword coupling"""
+    """Enhanced multi-task learning model focusing on correlation changes"""
 
     def __init__(self, company_system, tokenizer, keyword_dim=256, company_dim=128, latent_dim=128, max_keywords=100):
         self.company_system = company_system
@@ -117,7 +116,7 @@ class AttentionBasedNewsFactorModel:
         self.tokenizer = tokenizer
 
         mlflow.set_tracking_uri("sqlite:///mlflow.db")
-        mlflow.set_experiment("news_factor_trading")
+        mlflow.set_experiment("news_correlation_trading")
         
         self.model = self.build_model()
         
@@ -131,45 +130,30 @@ class AttentionBasedNewsFactorModel:
                 alpha=0.1
             ),
             weight_decay=1e-4,
-            clipnorm=1.0  # Gradient clipping
+            clipnorm=1.0
         )
         
         self.model.compile(
             optimizer=optimizer,
             loss={
-                'price_change_prediction': self._huber_loss,
-                'volatility_prediction': 'mse',
-                'relevance_prediction': 'binary_crossentropy',
-                'news_reconstruction': 'mae',
-                'attention_regularization': 'categorical_crossentropy'  # Added back
+                'correlation_changes_symmetric': 'mse',
+                'price_deviations': 'mse',
+                'news_reconstruction': 'mae'
             },
             loss_weights={
-                'price_change_prediction': 3.0,  # Main task
-                'volatility_prediction': 2.0,
-                'relevance_prediction': 1.5,
-                'news_reconstruction': 0.5,
-                'attention_regularization': 0.3  # Encourages meaningful attention patterns
+                'correlation_changes_symmetric': 3.0,
+                'price_deviations': 0.5,
+                'news_reconstruction': 0.5
             },
             metrics={
-                'price_change_prediction': ['mae'],
-                'volatility_prediction': ['mae'],
-                'relevance_prediction': ['accuracy', F1Score()],
-                'news_reconstruction': ['mae'],
-                'attention_regularization': ['accuracy']
+                'correlation_changes_symmetric': ['mae'],
+                'price_deviations': ['mae', 'mse'],
+                'news_reconstruction': ['mae']
             }
         )
 
-    def _huber_loss(self, y_true, y_pred, delta=1.0):
-        """Robust Huber loss for price predictions"""
-        error = y_true - y_pred
-        condition = tf.abs(error) <= delta
-        squared_loss = 0.5 * tf.square(error)
-        linear_loss = delta * tf.abs(error) - 0.5 * tf.square(delta)
-        return tf.where(condition, squared_loss, linear_loss)
-    
     def build_model(self):
-        """Multi-task model with shared company embeddings.
-        Combines global context informativeness with local keyword relevance via attention and reconstruction."""
+        """Multi-task model: global baseline + lightweight local corrections for correlation shifts."""
 
         # -----------------------------
         # 1. Inputs
@@ -186,14 +170,14 @@ class AttentionBasedNewsFactorModel:
             mask_zero=True,
             embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='keyword_embeddings'
-        )(keyword_input) # These learn impact patterns
+        )(keyword_input)
 
         attn_keywords = OptimizedAttentionLayer(
             num_heads=8,
-            key_dim=self.keyword_dim // 8,
+            key_dim=max(1, self.keyword_dim // 8),
             dropout_rate=0.1,
             name='keyword_attention'
-        )(keyword_embedding, keyword_embedding, keyword_embedding) # Discovers keyword co-occurrence patterns that predict similar impacts
+        )(keyword_embedding, keyword_embedding, keyword_embedding)
 
         keyword_latent = layers.Dense(
             self.latent_dim,
@@ -204,92 +188,175 @@ class AttentionBasedNewsFactorModel:
         keyword_latent = layers.Dropout(0.2)(keyword_latent)
 
         # -----------------------------
-        # 3. Company embedding
+        # 3. Company embeddings (single + all companies via same layer)
         # -----------------------------
-        company_emb = layers.Embedding(
+        company_embedding_layer = layers.Embedding(
             input_dim=self.company_system.num_companies,
             output_dim=self.company_dim,
             name='company_embeddings'
-        )(company_idx_input)
+        )
+        company_emb = company_embedding_layer(company_idx_input)  # [batch, 1, company_dim]
 
+        # All companies (batch, num_companies)
+        all_company_indices = tf.range(self.company_system.num_companies, dtype=tf.int32)
+        all_company_indices = tf.expand_dims(all_company_indices, 0)  # [1, N]
+        batch_size = tf.shape(company_idx_input)[0]
+        all_company_indices = tf.tile(all_company_indices, [batch_size, 1])  # [batch, N]
+
+        all_company_embeddings = company_embedding_layer(all_company_indices)  # [batch, N, company_dim]
+
+        # Process target company embedding into latent
         company_proc = layers.Dense(
             self.latent_dim,
             activation='relu',
             kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='company_processed'
-        )(company_emb)
+        )(company_emb)  # [batch, 1, latent_dim]
         company_proc = layers.BatchNormalization()(company_proc)
-        company_proc = layers.Dropout(0.1)(company_proc)
-        company_reshaped = layers.Reshape((1, self.latent_dim))(company_proc)
-
-        # Megjegyzés: Itt lehetne MultiHeadAttention a cégek saját embeddingjein, ha többdimenziós cégháló-struktúrát (pl. szektor, beszállítói lánc) akarunk modellezni, ha azonban a cég csak egyedi index és statikus embedding, akkor felesleges.
+        company_proc = layers.Dropout(0.15)(company_proc)
+        company_reshaped = layers.Reshape((1, self.latent_dim))(company_proc)  # same shape
 
         # -----------------------------
-        # 4. Bi-directional attention
+        # 4. (Optional) Company-aware keyword gating - keep but regularize hard
         # -----------------------------
-        gated_keywords = CompanyAwareKeywordGating(self.latent_dim, name='company_keyword_gating')(keyword_latent, company_proc)
-        
-        comp_to_news = layers.MultiHeadAttention(
-            num_heads=4,
-            key_dim=self.latent_dim // 4,
-            name='company_to_news'
-        )(company_reshaped, gated_keywords, gated_keywords)
+        # keep news meaning but allow company-contextualization; we therefore keep gating but apply stronger dropout.
+        gated_keywords = CompanyAwareKeywordGating(
+            self.latent_dim,
+            name='company_keyword_gating'
+        )(keyword_latent, company_proc)  # [batch, seq_len, latent_dim]
+        gated_keywords = layers.Dropout(0.35)(gated_keywords)
 
+        # small attention: how news modifies company representation (lightweight)
         news_to_comp = layers.MultiHeadAttention(
             num_heads=4,
-            key_dim=self.latent_dim // 4,
+            key_dim=max(1, self.latent_dim // 4),
             name='news_to_company'
         )(gated_keywords, company_reshaped, company_reshaped)
 
-        combined = layers.Concatenate(axis=-1)([
-            comp_to_news,
-            tf.reduce_mean(news_to_comp, axis=1, keepdims=True)
+        # -----------------------------
+        # 5. News representation aggregation (keeps the original news meaning for global baseline)
+        # -----------------------------
+        news_features = layers.Concatenate()([
+            layers.Flatten()(news_to_comp),                    # small company-aware signal
+            layers.Flatten()(company_proc),                    # target company info
+            layers.GlobalAveragePooling1D()(gated_keywords),   # news meaning preserved
+            layers.GlobalMaxPooling1D()(gated_keywords)
         ])
 
-        combined_norm = layers.LayerNormalization()(layers.Dense(
+        news_features = layers.Dense(
+            256,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4)
+        )(news_features)
+        news_features = layers.BatchNormalization()(news_features)
+        news_features = layers.Dropout(0.25)(news_features)
+
+        shared_news_rep = layers.Dense(
             self.latent_dim,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
+            name='shared_news_representation'
+        )(news_features)
+        shared_news_rep = layers.BatchNormalization()(shared_news_rep)
+        shared_news_rep = layers.Dropout(0.2)(shared_news_rep)  # final news embedding used by predictors
+
+        # -----------------------------
+        # 6. Unified predictor (global baseline + lightweight local corrections)
+        # -----------------------------
+        unified_predictor = layers.Dense(
+            256, activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4)
+        )(shared_news_rep)
+        unified_predictor = layers.Dropout(0.2)(unified_predictor)
+
+        # GLOBAL baseline: predict a price-change vector for all companies (one component per company)
+        # This is the raw global "price vector" that encodes the news' average expected effect across companies.
+        global_price_vector = layers.Dense(
+            self.company_system.num_companies,
+            activation='linear',
+            name='global_price_vector'
+        )(unified_predictor)  # [batch, N]
+
+        # From the global vector we can form an implied correlation-like matrix (outer product)
+        # normalized outer product -> gives a symmetric matrix per batch
+        def outer_normalized(x):
+            # x: [batch, N]
+            # outer: [batch, N, N]
+            outer = tf.einsum('bi,bj->bij', x, x)
+            # normalize by vector norm magnitudes to avoid scale blow-up
+            norm = tf.norm(x, axis=1, keepdims=True)  # [batch,1]
+            denom = tf.maximum(tf.einsum('bi,bj->bij', norm, norm), 1e-6)
+            return outer / denom
+
+        implied_matrix = layers.Lambda(outer_normalized, name='implied_correlation_matrix')(global_price_vector)
+        # implied_matrix in [-1,1] roughly (since global_price_vector in [-1,1])
+
+        # LIGHTWEIGHT per-company correction scalars (shared network applied to each company)
+        # we compute a per-company factor c_i = f(unified_predictor, company_emb_i) -> [batch, N, 1]
+        # implement with a small shared Dense applied to concatenated [unified_predictor, company_emb_i] via time-distributed style
+        # first, expand unified_predictor to [batch, N, up_dim]
+        up = layers.Dense(self.company_dim, activation='relu')(unified_predictor)  # [batch, company_dim]
+        up_expanded = layers.Lambda(lambda t: tf.expand_dims(t, axis=1))(up)      # [batch,1,company_dim]
+        up_tiled = layers.Lambda(lambda t: tf.tile(t, [1, self.company_system.num_companies, 1]))(up_expanded)  # [batch,N,company_dim]
+
+        # concatenate per-company: [batch, N, company_dim + company_dim]
+        per_company_input = layers.Concatenate(axis=-1)([up_tiled, all_company_embeddings])  # [batch,N, 2*company_dim]
+
+        # shared small network for per-company scalar
+        per_company_hidden = layers.TimeDistributed(layers.Dense(32, activation='tanh'))(per_company_input)  # [batch,N,32]
+        per_company_scalar = layers.TimeDistributed(layers.Dense(1, activation='linear'), name='per_company_scalar')(per_company_hidden)  # [batch,N,1]
+        per_company_scalar = layers.Reshape((self.company_system.num_companies,))(per_company_scalar)  # [batch, N]
+
+        # Build correction matrix as outer product of per_company_scalar (low-parametrization)
+        correction_matrix = layers.Lambda(lambda x: tf.einsum('bi,bj->bij', x, x),
+                                        name='correction_matrix')(per_company_scalar)  # [batch,N,N]
+
+        # Learned gate/scale between implied_matrix and correction_matrix (scalar per batch)
+        scale_logits = layers.Dense(1, activation='sigmoid', name='correction_scale')(unified_predictor)  # [batch,1] in (0,1)
+        scale_expanded = layers.Reshape((1, 1))(scale_logits)
+
+        # final predicted correlation change matrix = alpha * implied + (1-alpha) * correction (or sum with learned scaling)
+        correlation_changes = layers.Lambda(
+            lambda args: args[0] * args[2] + args[1] * (1.0 - args[2]),
+            name='correlation_changes_matrix'
+        )([implied_matrix, correction_matrix, scale_expanded])
+
+        # ensure symmetry and numerical stability (average with transpose)
+        # FONTOS: Linear activation, mert Fisher-z térben tanítunk! A correlation térbe való visszaalakítás (tanh) az inference során történik
+        correlation_changes = layers.Lambda(
+            lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])),
+            name='correlation_changes_symmetric'
+        )(correlation_changes)
+
+        # -----------------------------
+        # 7. Price deviations (per-company residuals) - small, regularized head
+        # -----------------------------
+        # Predict residual deviations from the global_price_vector per company
+        price_dev_input = layers.Concatenate()([unified_predictor, layers.Flatten()(all_company_embeddings)])  # [batch, 256 + N*company_dim]
+        price_dev_hidden = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5))(price_dev_input)
+        price_dev_hidden = layers.Dropout(0.2)(price_dev_hidden)
+        price_deviations = layers.Dense(
+            self.company_system.num_companies,
             activation='tanh',
-            name='attention_combination'
-        )(combined))
+            name='price_deviations'
+        )(price_dev_hidden)  # [batch, N]
+
+        # Optionally combine with global_price_vector to get final price vector prediction:
+        # final_price_vector = global_price_vector + 0.1 * price_deviations
+        # but we output deviations separately so training can weight them down if desired.
 
         # -----------------------------
-        # 5. Shared representation
+        # 8. News reconstruction (auxiliary, keeps news meaning)
         # -----------------------------
-        combined_features = layers.Concatenate()([
-            layers.Flatten()(combined_norm),
-            layers.Flatten()(company_proc),
-            layers.GlobalAveragePooling1D()(gated_keywords)
-        ])
-
-        x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4))(combined_features)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(0.3)(x)
-
-        shared = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4), name='shared_rep')(x)
-        shared = layers.BatchNormalization()(shared)
-        shared = layers.Dropout(0.2)(shared)
+        recon_out = self._create_news_recon(gated_keywords, shared_news_rep, company_emb)
 
         # -----------------------------
-        # 6. Prediction heads
+        # 9. Build model
         # -----------------------------
-        price = layers.Dropout(0.1)(layers.Dense(64, activation='relu')(shared))
-        price_out = layers.Dense(3, activation='linear', name='price_change_prediction')(price)
-
-        vol = layers.Dropout(0.1)(layers.Dense(64, activation='relu')(shared))
-        vol_out = layers.Dense(2, activation='linear', name='volatility_prediction')(vol)
-
-        rel = layers.Dropout(0.1)(layers.Dense(32, activation='relu')(shared))
-        rel_out = layers.Dense(1, activation='sigmoid', name='relevance_prediction')(rel)
-
-        recon_out = self._create_news_recon(gated_keywords, shared, company_emb)
-
-        attn_reg = layers.Dropout(0.1)(layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4))(shared))
-        attn_reg_out = layers.Dense(self.max_keywords, activation='softmax', name='attention_regularization')(attn_reg)
-
         return models.Model(
             inputs=[keyword_input, company_idx_input],
-            outputs=[price_out, vol_out, rel_out, recon_out, attn_reg_out],
-            name='NewsFactorModel'
+            outputs=[correlation_changes, price_deviations, recon_out],
+            name='NewsCorrelationHybridModel'
         )
 
     def _create_news_recon(self, keyword_latent, shared, company_emb):
@@ -309,11 +376,10 @@ class AttentionBasedNewsFactorModel:
         recon_input = layers.Concatenate(axis=-1)([global_hidden, pooled_news])
         recon_input = layers.Dropout(0.2)(recon_input)
         return layers.Dense(self.latent_dim, activation='tanh', name='news_reconstruction')(recon_input)
-    
+
     def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
-        """Train the multi-task model"""
+        """Train the correlation-focused model"""
         with mlflow.start_run():
-            # Log hyperparameters
             mlflow.log_params({
                 'epochs': epochs,
                 'batch_size': batch_size,
@@ -323,66 +389,65 @@ class AttentionBasedNewsFactorModel:
                 'max_keywords': self.max_keywords
             })
             
-            # Custom callback for MLflow logging
             class MLflowCallback(callbacks.Callback):
                 def on_epoch_end(self, epoch, logs=None):
                     if logs:
                         for metric, value in logs.items():
                             mlflow.log_metric(metric, value, step=epoch)
 
+            # ---- Train data ----
             X_keywords = np.squeeze(np.array(training_data['keywords']), axis=1)
             X_company_indices = np.array(training_data['company_indices']).reshape(-1, 1)
             
-            y_price_changes = np.array(training_data['price_changes'])
-            y_volatility_changes = np.array(training_data['volatility_changes'])
-            y_relevance = np.expand_dims(np.array(training_data['relevance_labels']), -1)  # Shape fix for binary classification
-            y_news_targets = np.array(training_data['news_targets'])
-            
-            # Create attention regularization targets (uniform distribution encourages diverse attention)
-            y_attention_reg = np.ones((len(X_keywords), self.max_keywords)) / self.max_keywords
-            
+            y_correlation_changes = np.array(training_data['correlation_changes'])  # [batch, N, N]
+            y_price_deviations = np.array(training_data['price_deviations'])        # [batch, N]
+            y_news_targets = np.array(training_data['news_targets'])                # reconstruction
+
+            # ---- Validation ----
             validation_data_prepared = None
             if validation_data:
                 val_X_keywords = np.array(validation_data['keywords'])
                 val_X_company_indices = np.array(validation_data['company_indices']).reshape(-1, 1)
-                val_y_price_changes = np.array(validation_data['price_changes'])
-                val_y_volatility_changes = np.array(validation_data['volatility_changes'])
-                val_y_relevance = np.expand_dims(np.array(validation_data['relevance_labels']), -1)  # Shape fix for binary classification
+                val_y_correlation_changes = np.array(validation_data['correlation_changes'])
+                val_y_price_deviations = np.array(validation_data['price_deviations'])
                 val_y_news_targets = np.array(validation_data['news_targets'])
-                val_y_attention_reg = np.ones((len(val_X_keywords), self.max_keywords)) / self.max_keywords
                 
                 validation_data_prepared = (
                     [val_X_keywords, val_X_company_indices],
-                    [val_y_price_changes, val_y_volatility_changes, val_y_relevance, val_y_news_targets, val_y_attention_reg]
+                    [val_y_correlation_changes, val_y_price_deviations, val_y_news_targets]
                 )
             
+            # ---- Train ----
             history = self.model.fit(
                 [X_keywords, X_company_indices],
-                [y_price_changes, y_volatility_changes, y_relevance, y_news_targets, y_attention_reg],
+                [y_correlation_changes, y_price_deviations, y_news_targets],
                 validation_data=validation_data_prepared,
                 epochs=epochs,
                 batch_size=batch_size,
                 callbacks=[
                     callbacks.EarlyStopping(
-                        monitor='val_loss' if validation_data else 'loss', patience=15, restore_best_weights=True
+                        monitor='val_loss' if validation_data else 'loss', 
+                        patience=15, 
+                        restore_best_weights=True
                     ),
                     callbacks.ReduceLROnPlateau(
-                        monitor='val_loss' if validation_data else 'loss', factor=0.5, patience=8, min_lr=1e-6
+                        monitor='val_loss' if validation_data else 'loss', 
+                        factor=0.5, 
+                        patience=8, 
+                        min_lr=1e-6
                     ),
                     MLflowCallback()
                 ],
                 verbose=1
             )
             
-            mlflow.tensorflow.log_model(
-                self.model, 
-                "news_factor_model"
-            )
+            mlflow.tensorflow.log_model(self.model, "news_correlation_model")
             
-            # Log performance metrics
             if validation_data:
                 mlflow.log_metric('best_val_loss', min(history.history['val_loss']))
+        
         return history
+
     
     def prepare_keyword_sequence(self, text, max_length=None):
         return self.tokenizer.encode(text, max_length or self.max_keywords)
