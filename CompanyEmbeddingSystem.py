@@ -46,7 +46,7 @@ class CompanyEmbeddingSystem:
         self._bert_cache[text_key] = embedding.copy()
         
         # Simple cache size management
-        if len(self._bert_cache) > 1000:
+        if len(self._bert_cache) > 100:
             # Remove half of the cache when it gets too big
             keys_to_remove = list(self._bert_cache.keys())[:500]
             for key in keys_to_remove:

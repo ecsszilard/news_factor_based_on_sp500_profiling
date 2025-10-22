@@ -128,7 +128,7 @@ class AdvancedTradingSystem:
         return 0.0
     
     def analyze_news_impact(self, news_text, target_companies=None, correlation_threshold=0.1):
-        """Analyze news impact using correlation change predictions"""
+        """Analyze news impact using correlation change predictions (Fisher-z transformed)"""
         if target_companies is None:
             target_companies = self.company_system.companies[:10]  # Limit to first 10 for efficiency
         
@@ -142,8 +142,8 @@ class AdvancedTradingSystem:
             verbose=0
         )
         
-        correlation_changes = predictions[0][0]  # [N, N]
-        price_deviations = predictions[1][0]     # [N]
+        correlation_changes = np.tanh(predictions[0][0])  # [N, N] from Fisher-z space back to correlation space [-1, 1]
+        price_deviations = predictions[1][0]              # [N]
         
         for company in target_companies:
             company_idx = self.company_system.get_company_idx(company)
@@ -207,7 +207,7 @@ class AdvancedTradingSystem:
             confidence = analysis['confidence']
             correlation_impact = analysis.get('correlation_impact', {})
             
-            # Filter by confidence only (nincs külön relevance)
+            # Filter by confidence
             if confidence < confidence_threshold:
                 continue
             

@@ -8,7 +8,7 @@ logger = logging.getLogger("AdvancedNewsFactor.ImprovedTokenizer")
 class ImprovedTokenizer:
     """Advanced tokenization system with BERT-like tokenization"""
     
-    def __init__(self, all_news_texts, vocab_size=50000):
+    def __init__(self, all_news_texts, vocab_size=10000):
         self.vocab_size = vocab_size
         self.word_to_idx = {'[PAD]': 0, '[UNK]': 1, '[CLS]': 2, '[SEP]': 3}
         self.idx_to_word = {0: '[PAD]', 1: '[UNK]', 2: '[CLS]', 3: '[SEP]'}

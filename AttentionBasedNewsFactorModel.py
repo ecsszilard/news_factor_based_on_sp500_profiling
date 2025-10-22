@@ -141,7 +141,7 @@ class AttentionBasedNewsFactorModel:
                 'news_reconstruction': 'mae'
             },
             loss_weights={
-                'correlation_changes_symmetric': 3.0,
+                'correlation_changes_symmetric': 4.0,
                 'price_deviations': 0.5,
                 'news_reconstruction': 0.5
             },
@@ -288,8 +288,7 @@ class AttentionBasedNewsFactorModel:
             denom = tf.maximum(tf.einsum('bi,bj->bij', norm, norm), 1e-6)
             return outer / denom
 
-        implied_matrix = layers.Lambda(outer_normalized, name='implied_correlation_matrix')(global_price_vector)
-        # implied_matrix in [-1,1] roughly (since global_price_vector in [-1,1])
+        implied_matrix = layers.Lambda(outer_normalized, name='implied_correlation_matrix')(global_price_vector) # unbounded, because global_price_vector is in Fisher-z space
 
         # LIGHTWEIGHT per-company correction scalars (shared network applied to each company)
         # we compute a per-company factor c_i = f(unified_predictor, company_emb_i) -> [batch, N, 1]
@@ -308,8 +307,7 @@ class AttentionBasedNewsFactorModel:
         per_company_scalar = layers.Reshape((self.company_system.num_companies,))(per_company_scalar)  # [batch, N]
 
         # Build correction matrix as outer product of per_company_scalar (low-parametrization)
-        correction_matrix = layers.Lambda(lambda x: tf.einsum('bi,bj->bij', x, x),
-                                        name='correction_matrix')(per_company_scalar)  # [batch,N,N]
+        correction_matrix = layers.Lambda(lambda x: tf.einsum('bi,bj->bij', x, x), name='correction_matrix')(per_company_scalar)  # [batch,N,N]
 
         # Learned gate/scale between implied_matrix and correction_matrix (scalar per batch)
         scale_logits = layers.Dense(1, activation='sigmoid', name='correction_scale')(unified_predictor)  # [batch,1] in (0,1)
@@ -322,7 +320,7 @@ class AttentionBasedNewsFactorModel:
         )([implied_matrix, correction_matrix, scale_expanded])
 
         # ensure symmetry and numerical stability (average with transpose)
-        # FONTOS: Linear activation, mert Fisher-z térben tanítunk! A correlation térbe való visszaalakítás (tanh) az inference során történik
+        # IMPORTANT: Linear activation, in Fisher-z space! The transformation back to correlation space (tanh) is done in AdvancedTradingSystem.analyze_news_impact()
         correlation_changes = layers.Lambda(
             lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])),
             name='correlation_changes_symmetric'
