@@ -6,21 +6,20 @@ import logging
 
 logger = logging.getLogger("AdvancedNewsFactor.CompanyEmbeddingSystem")
 
-class CompanyEmbeddingSystem:
+class EmbeddingAndTokenizerSystem:
     """Embedding companies in vector space based on news, fundamentals and price movements"""
     
-    def __init__(self, companies_file='sp500_companies.csv', embedding_dim=512):
-        self.embedding_dim = embedding_dim
-        self.companies_df = pd.read_csv(companies_file)
-        self.companies = self.companies_df['symbol'].tolist()
+    def __init__(self, companies):
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         self.bert_model = AutoModel.from_pretrained('bert-base-uncased')
         self.bert_model.eval()
         
         # Learnable company embeddings instead of fixed feature-based embeddings
-        self.num_companies = len(self.companies)
-        self.company_to_idx = {symbol: i for i, symbol in enumerate(self.companies)}
-        self.idx_to_company = {i: symbol for i, symbol in enumerate(self.companies)}
+        self.company_to_idx = {symbol: i for i, symbol in enumerate(companies)}
+        self.idx_to_company = {i: symbol for i, symbol in enumerate(companies)}
+
+        self.word_to_idx = self.tokenizer.vocab
+        self.idx_to_word = {v: k for k, v in self.word_to_idx.items()}
         
         # Static features for initialization only
         self.static_features = {}
@@ -99,5 +98,12 @@ class CompanyEmbeddingSystem:
             
         self.static_features[symbol] = features
     
-    def get_company_idx(self, symbol):
-        return self.company_to_idx.get(symbol, 0)  # Return 0 for unknown companies
+    def prepare_keyword_sequence(self, text, max_length):
+        inputs = self.tokenizer(
+            text, 
+            return_tensors='tf',
+            max_length=max_length,
+            truncation=True, 
+            padding='max_length'
+        )
+        return inputs['input_ids']

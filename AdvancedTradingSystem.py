@@ -10,9 +10,10 @@ logger = logging.getLogger("AdvancedNewsFactor.AdvancedTradingSystem")
 class AdvancedTradingSystem:
     """Trading system using correlation-based news factor model"""
 
-    def __init__(self, company_embedding_system, news_factor_model):
-        self.company_system = company_embedding_system
+    def __init__(self, embeddingAndTokenizerSystem, news_factor_model, companies):
+        self.embeddingAndTokenizerSystem = embeddingAndTokenizerSystem
         self.news_model = news_factor_model
+        self.companies = companies
         
         # Trading data
         self.positions = {}
@@ -30,8 +31,8 @@ class AdvancedTradingSystem:
     def get_similar_companies_by_news_response(self, target_company, top_k=5):
         return self._get_similar_items(
             target_key=target_company,
-            idx_lookup=self.company_system.company_to_idx,
-            name_lookup=self.company_system.idx_to_company,
+            idx_lookup=self.embeddingAndTokenizerSystem.company_to_idx,
+            name_lookup=self.embeddingAndTokenizerSystem.idx_to_company,
             embedding_layer_name="company_embeddings",
             top_k=top_k
         )
@@ -39,11 +40,11 @@ class AdvancedTradingSystem:
     def get_similar_keywords_by_impact(self, target_word, top_k=10):
         return self._get_similar_items(
             target_key=target_word,
-            idx_lookup=self.news_model.tokenizer.word_to_idx,
-            name_lookup={v: k for k, v in self.news_model.tokenizer.word_to_idx.items()},
-            embedding_layer_name="keyword_embeddings", # Shape: (vocab_size, keyword_dim)
+            idx_lookup=self.embeddingAndTokenizerSystem.word_to_idx,  
+            name_lookup=self.embeddingAndTokenizerSystem.idx_to_word,
+            embedding_layer_name="keyword_embeddings",
             top_k=top_k,
-            invalid_tokens={'[PAD]', '[UNK]', '[CLS]', '[SEP]'}
+            invalid_tokens={'[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]'} 
         )
     
     def _get_similar_items(self, target_key, idx_lookup, name_lookup, embedding_layer_name, top_k=5, invalid_tokens=None):
@@ -130,23 +131,18 @@ class AdvancedTradingSystem:
     def analyze_news_impact(self, news_text, target_companies=None, correlation_threshold=0.1):
         """Analyze news impact using correlation change predictions (Fisher-z transformed)"""
         if target_companies is None:
-            target_companies = self.company_system.companies[:10]  # Limit to first 10 for efficiency
+            target_companies = self.companies[:10]  # Limit to first 10 for efficiency
         
-        news_analysis = {}
-        keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
         # If no specific company, use the first one as context
-        company_idx = self.company_system.get_company_idx(target_companies[0] if target_companies else 0)
+        company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(target_companies[0], 0)
         # Get correlation change predictions for the news
-        predictions = self.news_model.model.predict(
-            [keyword_sequence, np.array([[company_idx]])],
-            verbose=0
-        )
+        predictions = self.news_model.model.predict([self.embeddingAndTokenizerSystem.prepare_keyword_sequence(news_text, self.news_model.max_keywords), np.array([[company_idx]])], verbose=0)
         
         correlation_changes = np.tanh(predictions[0][0])  # [N, N] from Fisher-z space back to correlation space [-1, 1]
         price_deviations = predictions[1][0]              # [N]
         
         for company in target_companies:
-            company_idx = self.company_system.get_company_idx(company)
+            company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(company, 0)
             if company_idx >= len(correlation_changes):
                 continue
             
@@ -160,8 +156,8 @@ class AdvancedTradingSystem:
             # Find most affected correlations
             significant_changes = []
             for other_idx, corr_change in enumerate(company_correlation_changes):
-                if abs(corr_change) > correlation_threshold and other_idx < len(self.company_system.companies):
-                    other_company = self.company_system.companies[other_idx]
+                if abs(corr_change) > correlation_threshold and other_idx < len(self.companies):
+                    other_company = self.companies[other_idx]
                     significant_changes.append((other_company, corr_change))
             
             significant_changes.sort(key=lambda x: abs(x[1]), reverse=True)
@@ -176,6 +172,7 @@ class AdvancedTradingSystem:
             # Adding price deviation to the prediction
             price_dev = price_deviations[company_idx] if company_idx < len(price_deviations) else 0.0
             
+            news_analysis = {}
             news_analysis[company] = {
                 'confidence': signal_strength, # Use correlation change magnitude as confidence
                 'predicted_changes': {
@@ -310,16 +307,16 @@ class AdvancedTradingSystem:
         self.news_model.model.save(os.path.join(path, 'correlation_news_model.h5'))
         
         # Save company mapping
-        with open(os.path.join(path, 'company_system.pkl'), 'wb') as f:
+        with open(os.path.join(path, 'embeddingAndTokenizerSystem.pkl'), 'wb') as f:
             pickle.dump({
-                'company_to_idx': self.company_system.company_to_idx,
-                'idx_to_company': self.company_system.idx_to_company,
-                'companies': self.company_system.companies,
-                'static_features': self.company_system.static_features
+                'company_to_idx': self.embeddingAndTokenizerSystem.company_to_idx,
+                'idx_to_company': self.embeddingAndTokenizerSystem.idx_to_company,
+                'companies': self.companies,
+                'static_features': self.embeddingAndTokenizerSystem.static_features
             }, f)
         
         with open(os.path.join(path, 'tokenizer.pkl'), 'wb') as f:
-            pickle.dump(self.news_model.tokenizer, f)
+            pickle.dump(self.embeddingAndTokenizerSystem, f)
         
         # Save trading data including correlation matrix
         with open(os.path.join(path, 'trading_data.pkl'), 'wb') as f:
@@ -339,12 +336,12 @@ class AdvancedTradingSystem:
                 os.path.join(path, 'correlation_news_model.h5')
             )
             
-            with open(os.path.join(path, 'company_system.pkl'), 'rb') as f:
+            with open(os.path.join(path, 'embeddingAndTokenizerSystem.pkl'), 'rb') as f:
                 company_data = pickle.load(f)
-                self.company_system.company_to_idx = company_data['company_to_idx']
-                self.company_system.idx_to_company = company_data['idx_to_company']
-                self.company_system.companies = company_data['companies']
-                self.company_system.static_features = company_data['static_features']
+                self.embeddingAndTokenizerSystem.company_to_idx = company_data['company_to_idx']
+                self.embeddingAndTokenizerSystem.idx_to_company = company_data['idx_to_company']
+                self.companies = company_data['companies']
+                self.embeddingAndTokenizerSystem.static_features = company_data['static_features']
             
             with open(os.path.join(path, 'tokenizer.pkl'), 'rb') as f:
                 self.news_model.tokenizer = pickle.load(f)

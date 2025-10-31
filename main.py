@@ -3,12 +3,11 @@ import pandas as pd
 import time
 import logging
 
-from CompanyEmbeddingSystem import CompanyEmbeddingSystem
+from EmbeddingAndTokenizerSystem import EmbeddingAndTokenizerSystem
 from AttentionBasedNewsFactorModel import AttentionBasedNewsFactorModel
 from NewsDataProcessor import NewsDataProcessor
 from AdvancedTradingSystem import AdvancedTradingSystem
 from PerformanceAnalyzer import PerformanceAnalyzer
-from ImprovedTokenizer import ImprovedTokenizer
 
 # Logging settings
 logging.basicConfig(
@@ -144,15 +143,15 @@ if __name__ == "__main__":
 
     # --- Sample data & system setup ---
     companies_df, sample_news, sample_prices = create_sample_data()
-    companies_df.to_csv("sp500_companies.csv", index=False)
+    companies = list(sample_prices.keys())
+    max_keywords=100
 
-    company_system = CompanyEmbeddingSystem("sp500_companies.csv")
-    tokenizer = ImprovedTokenizer([n["text"] for n in sample_news], vocab_size=50_000)
-    news_model = AttentionBasedNewsFactorModel(company_system, tokenizer)
+    embeddingAndTokenizerSystem = EmbeddingAndTokenizerSystem(companies)
+    news_model = AttentionBasedNewsFactorModel(embeddingAndTokenizerSystem, max_keywords)
 
     # --- Store static company features ---
     for _, row in companies_df.iterrows():
-        company_system.store_static_features(
+        embeddingAndTokenizerSystem.store_static_features(
             symbol=row["symbol"],
             fundamental_data={
                 "market_cap": np.random.uniform(1e10, 1e12),
@@ -180,7 +179,7 @@ if __name__ == "__main__":
         )
 
     # --- Trading system setup ---
-    trading_system = AdvancedTradingSystem(company_system, news_model)
+    trading_system = AdvancedTradingSystem(embeddingAndTokenizerSystem, news_model, companies)
 
     print("Updating correlation matrix...")
     trading_system.update_correlation_matrix(sample_prices)
@@ -194,7 +193,7 @@ if __name__ == "__main__":
                 print(f"  {c1} <-> {c2}: {corr:.3f}")
 
     # --- Training data ---
-    data_processor = NewsDataProcessor(company_system, news_model)
+    data_processor = NewsDataProcessor(embeddingAndTokenizerSystem, news_model)
     training_data = data_processor.process_news_batch(sample_news, sample_prices)
 
     if len(training_data["keywords"]) >= 5:
@@ -243,7 +242,7 @@ if __name__ == "__main__":
                 print(f"  '{keyword}' clusters with: {similar_names}")
 
         test_word = "breakthrough"
-        if test_word in tokenizer.word_to_idx:
+        if test_word in embeddingAndTokenizerSystem.word_to_idx:
             print(f"\nSimilar keywords to '{test_word}':")
             for w, sim in trading_system.get_similar_keywords_by_impact(test_word, 5):
                 print(f"  {w}: {sim:.3f}")
@@ -270,13 +269,8 @@ if __name__ == "__main__":
     print("\n🔍 Correlation Learning Analysis:")
     
     # Get a prediction for the test news
-    keyword_sequence = news_model.prepare_keyword_sequence(test_news)
-    company_idx = company_system.get_company_idx(target_companies[0])
-    
-    predictions = news_model.model.predict(
-        [keyword_sequence, np.array([[company_idx]])],
-        verbose=0
-    )
+    company_idx = embeddingAndTokenizerSystem.company_to_idx.get(target_companies[0], 0)
+    predictions = news_model.model.predict([embeddingAndTokenizerSystem.prepare_keyword_sequence(test_news, max_keywords), np.array([[company_idx]])], verbose=0)
     
     correlation_pred = {
         'correlation_changes': predictions[0][0],  # [N, N] matrix
@@ -284,7 +278,7 @@ if __name__ == "__main__":
         'reconstruction': predictions[2][0],       # [latent_dim] vector
         'relevance_score': np.mean(np.abs(predictions[0][0])),  # average correlation change
         'reconstruction_quality': 1.0 / (1.0 + np.mean(np.abs(predictions[2][0]))),  # the smaller the recon error, the better
-        'company_names': company_system.companies
+        'company_names': companies
     }
     
     print(f"  Overall relevance score: {correlation_pred['relevance_score']:.3f}")

@@ -107,13 +107,13 @@ class CompanyAwareKeywordGating(layers.Layer):
 class AttentionBasedNewsFactorModel:
     """Enhanced multi-task learning model focusing on correlation changes"""
 
-    def __init__(self, company_system, tokenizer, keyword_dim=256, company_dim=128, latent_dim=128, max_keywords=100):
-        self.company_system = company_system
+    def __init__(self, embeddingAndTokenizerSystem, max_keywords, keyword_dim=256, company_dim=128, latent_dim=128):
+        self.embeddingAndTokenizerSystem = embeddingAndTokenizerSystem
         self.keyword_dim = keyword_dim
         self.company_dim = company_dim
         self.latent_dim = latent_dim
         self.max_keywords = max_keywords
-        self.tokenizer = tokenizer
+        self.num_companies = len(self.embeddingAndTokenizerSystem.company_to_idx)
 
         mlflow.set_tracking_uri("sqlite:///mlflow.db")
         mlflow.set_experiment("news_correlation_trading")
@@ -165,7 +165,7 @@ class AttentionBasedNewsFactorModel:
         # 2. Keyword encoder (impact-aware)
         # -----------------------------
         keyword_embedding = layers.Embedding(
-            input_dim=self.tokenizer.vocab_size,
+            input_dim=len(self.embeddingAndTokenizerSystem.word_to_idx),
             output_dim=self.keyword_dim,
             mask_zero=True,
             embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
@@ -191,14 +191,14 @@ class AttentionBasedNewsFactorModel:
         # 3. Company embeddings (single + all companies via same layer)
         # -----------------------------
         company_embedding_layer = layers.Embedding(
-            input_dim=self.company_system.num_companies,
+            input_dim=self.num_companies,
             output_dim=self.company_dim,
             name='company_embeddings'
         )
         company_emb = company_embedding_layer(company_idx_input)  # [batch, 1, company_dim]
 
         # All companies (batch, num_companies)
-        all_company_indices = tf.range(self.company_system.num_companies, dtype=tf.int32)
+        all_company_indices = tf.range(self.num_companies, dtype=tf.int32)
         all_company_indices = tf.expand_dims(all_company_indices, 0)  # [1, N]
         batch_size = tf.shape(company_idx_input)[0]
         all_company_indices = tf.tile(all_company_indices, [batch_size, 1])  # [batch, N]
@@ -272,7 +272,7 @@ class AttentionBasedNewsFactorModel:
         # GLOBAL baseline: predict a price-change vector for all companies (one component per company)
         # This is the raw global "price vector" that encodes the news' average expected effect across companies.
         global_price_vector = layers.Dense(
-            self.company_system.num_companies,
+            self.num_companies,
             activation='linear',
             name='global_price_vector'
         )(unified_predictor)  # [batch, N]
@@ -296,7 +296,7 @@ class AttentionBasedNewsFactorModel:
         # first, expand unified_predictor to [batch, N, up_dim]
         up = layers.Dense(self.company_dim, activation='relu')(unified_predictor)  # [batch, company_dim]
         up_expanded = layers.Lambda(lambda t: tf.expand_dims(t, axis=1))(up)      # [batch,1,company_dim]
-        up_tiled = layers.Lambda(lambda t: tf.tile(t, [1, self.company_system.num_companies, 1]))(up_expanded)  # [batch,N,company_dim]
+        up_tiled = layers.Lambda(lambda t: tf.tile(t, [1, self.num_companies, 1]))(up_expanded)  # [batch,N,company_dim]
 
         # concatenate per-company: [batch, N, company_dim + company_dim]
         per_company_input = layers.Concatenate(axis=-1)([up_tiled, all_company_embeddings])  # [batch,N, 2*company_dim]
@@ -304,7 +304,7 @@ class AttentionBasedNewsFactorModel:
         # shared small network for per-company scalar
         per_company_hidden = layers.TimeDistributed(layers.Dense(32, activation='tanh'))(per_company_input)  # [batch,N,32]
         per_company_scalar = layers.TimeDistributed(layers.Dense(1, activation='linear'), name='per_company_scalar')(per_company_hidden)  # [batch,N,1]
-        per_company_scalar = layers.Reshape((self.company_system.num_companies,))(per_company_scalar)  # [batch, N]
+        per_company_scalar = layers.Reshape((self.num_companies,))(per_company_scalar)  # [batch, N]
 
         # Build correction matrix as outer product of per_company_scalar (low-parametrization)
         correction_matrix = layers.Lambda(lambda x: tf.einsum('bi,bj->bij', x, x), name='correction_matrix')(per_company_scalar)  # [batch,N,N]
@@ -334,7 +334,7 @@ class AttentionBasedNewsFactorModel:
         price_dev_hidden = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5))(price_dev_input)
         price_dev_hidden = layers.Dropout(0.2)(price_dev_hidden)
         price_deviations = layers.Dense(
-            self.company_system.num_companies,
+            self.num_companies,
             activation='tanh',
             name='price_deviations'
         )(price_dev_hidden)  # [batch, N]
@@ -446,10 +446,6 @@ class AttentionBasedNewsFactorModel:
         
         return history
 
-    
-    def prepare_keyword_sequence(self, text, max_length=None):
-        return self.tokenizer.encode(text, max_length or self.max_keywords)
-
     def analyze_keyword_impact_clusters(self, sample_keywords, similarity_threshold=0.7, return_matrix=False):
         """Analyze how keywords cluster based on their learned impact patterns"""
         if not sample_keywords:
@@ -466,7 +462,7 @@ class AttentionBasedNewsFactorModel:
         embeddings = []
         
         for word in sample_keywords:
-            idx = self.tokenizer.word_to_idx.get(word)
+            idx = self.embeddingAndTokenizerSystem.word_to_idx.get(word)
             if idx is not None and idx < len(all_embeddings):
                 valid_keywords.append(word)
                 embeddings.append(all_embeddings[idx])

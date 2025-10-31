@@ -7,9 +7,9 @@ logger = logging.getLogger("AdvancedNewsFactor.NewsDataProcessor")
 class NewsDataProcessor:
     """Processing news data to train the correlation-focused model"""
     
-    def __init__(self, company_system, news_model):
+    def __init__(self, embeddingAndTokenizerSystem, news_model):
         """Initialize the news data processor"""
-        self.company_system = company_system
+        self.embeddingAndTokenizerSystem = embeddingAndTokenizerSystem
         self.news_model = news_model
         self.processed_news = []
         
@@ -57,13 +57,11 @@ class NewsDataProcessor:
             affected_companies = news_item['companies']
             news_timestamp = news_item['timestamp']
             
-            keyword_sequence = self.news_model.prepare_keyword_sequence(news_text)
+            keyword_sequence = self.embeddingAndTokenizerSystem.prepare_keyword_sequence(news_text, self.news_model.max_keywords)
             # Generate news target embedding
-            news_targets = self.company_system.get_bert_embedding(news_text)[:self.news_model.latent_dim]
+            news_targets = self.embeddingAndTokenizerSystem.get_bert_embedding(news_text)[:self.news_model.latent_dim]
             
-            price_deviations = self.calculate_price_deviations(
-                price_data, news_timestamp, baseline_correlations, affected_companies
-            )
+            price_deviations = self.calculate_price_deviations(price_data, news_timestamp, baseline_correlations, affected_companies)
             
             if price_deviations is None:
                 continue
@@ -80,8 +78,8 @@ class NewsDataProcessor:
             correlation_changes = self.fisher_z_transform(correlation_changes_raw)
             
             # Use the first affected company as the primary context
-            primary_company = affected_companies[0] if affected_companies else self.company_system.companies[0]
-            company_idx = self.company_system.get_company_idx(primary_company)
+            primary_company = affected_companies[0] if affected_companies else self.embeddingAndTokenizerSystem.companies[0]
+            company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(primary_company, 0)
             
             training_samples['keywords'].append(keyword_sequence)
             training_samples['company_indices'].append(company_idx)
@@ -95,8 +93,7 @@ class NewsDataProcessor:
     def calculate_price_deviations(self, price_data, news_timestamp, baseline_correlations, affected_companies, window_days=5):
         """Számítja az árfolyamváltozások eltérését a korrelációk alapján várttól"""
         companies = list(price_data.keys())
-        num_companies = len(companies)
-        deviations = np.zeros(num_companies)
+        deviations = np.zeros(len(companies))
         
         # Tényleges hozamok minden cégre
         actual_returns = {}
