@@ -6,9 +6,11 @@ import pickle
 import os
 
 logger = logging.getLogger("AdvancedNewsFactor.AdvancedTradingSystem")
+models = tf.keras.models
+from NewsDataProcessor import NewsDataProcessor
 
 class AdvancedTradingSystem:
-    """Trading system using correlation-based news factor model"""
+    """Trading system using correlation-based news factor model with Residual Learning"""
 
     def __init__(self, embeddingAndTokenizerSystem, news_factor_model, companies):
         self.embeddingAndTokenizerSystem = embeddingAndTokenizerSystem
@@ -26,7 +28,7 @@ class AdvancedTradingSystem:
         self.take_profit_pct = 0.06    # 6% take profit
         
         self.correlation_matrix = {}
-        logger.info("AdvancedTradingSystem initialized")
+        logger.info("AdvancedTradingSystem initialized with Residual Learning")
     
     def get_similar_companies_by_news_response(self, target_company, top_k=5):
         return self._get_similar_items(
@@ -54,7 +56,6 @@ class AdvancedTradingSystem:
         
         target_idx = idx_lookup[target_key]
 
-        # Extract embeddings
         try:
             embedding_layer = self.news_model.model.get_layer(embedding_layer_name)
             all_embeddings = embedding_layer.get_weights()[0]
@@ -128,75 +129,106 @@ class AdvancedTradingSystem:
             return self.correlation_matrix[company2].get(company1, 0.0)
         return 0.0
     
-    def analyze_news_impact(self, news_text, target_companies=None, correlation_threshold=0.1):
-        """Analyze news impact using correlation change predictions (Fisher-z transformed)"""
+    def analyze_news_impact(self, news_text, target_companies=None, correlation_threshold=0.05):
+        """
+        Analyze news impact using RESIDUAL LEARNING model
+        
+        Key changes:
+        1. Now passes baseline correlation as input to the model
+        2. Model predicts post-news correlation (baseline + delta)
+        3. Calculates and returns the delta explicitly
+        """
         if target_companies is None:
             target_companies = self.companies[:10]  # Limit to first 10 for efficiency
         
-        # If no specific company, use the first one as context
-        company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(target_companies[0], 0)
-        # Get correlation change predictions for the news
-        predictions = self.news_model.model.predict([self.embeddingAndTokenizerSystem.prepare_keyword_sequence(news_text, self.news_model.max_keywords), np.array([[company_idx]])], verbose=0)
+        # Get current baseline correlation matrix
+        baseline_matrix = self._get_baseline_correlation_matrix()
+        # Import processor for Fisher-z transforms
+        data_processor = NewsDataProcessor(self.embeddingAndTokenizerSystem, self.news_model)
+        baseline_z = data_processor.fisher_z_transform(baseline_matrix)
         
-        correlation_changes = np.tanh(predictions[0][0])  # [N, N] from Fisher-z space back to correlation space [-1, 1]
-        price_deviations = predictions[1][0]              # [N]
+        # Prepare keyword sequence
+        keyword_sequence = self.embeddingAndTokenizerSystem.prepare_keyword_sequence(
+            news_text, 
+            self.news_model.max_keywords
+        )
+        
+        results = {}
         
         for company in target_companies:
             company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(company, 0)
-            if company_idx >= len(correlation_changes):
-                continue
             
-            # Analyze how this company's correlations are expected to change
-            company_correlation_changes = correlation_changes[company_idx, :]
+            # Predict with baseline as input
+            predictions = self.news_model.model.predict([keyword_sequence, np.array([[company_idx]]), np.expand_dims(baseline_z, 0)], verbose=0)
             
-            # Calculate impact metrics
-            max_correlation_change = np.max(np.abs(company_correlation_changes))
-            mean_correlation_change = np.mean(company_correlation_changes)
+            # Extract predictions
+            predicted_corr_z = predictions[0][0]  # Fisher-z space [N, N]
+            price_deviations = predictions[1][0]  # [N]
+            reconstruction = predictions[2][0]     # [latent_dim]
             
-            # Find most affected correlations
-            significant_changes = []
-            for other_idx, corr_change in enumerate(company_correlation_changes):
-                if abs(corr_change) > correlation_threshold and other_idx < len(self.companies):
-                    other_company = self.companies[other_idx]
-                    significant_changes.append((other_company, corr_change))
+            # ⭐ Calculate the DELTA explicitly
+            # The model outputs: baseline + delta, so delta = output - baseline
+            delta_z = predicted_corr_z - baseline_z
             
-            significant_changes.sort(key=lambda x: abs(x[1]), reverse=True)
+            # Convert back to correlation space
+            predicted_corr = data_processor.inverse_fisher_z_transform(predicted_corr_z)
+            baseline_corr = data_processor.inverse_fisher_z_transform(baseline_z)
+            delta_corr = predicted_corr - baseline_corr
             
-            # Calculate trading signal strength based on correlation disruption
-            signal_strength = min(max_correlation_change * 5.0, 1.0)
-            # Determine direction based on correlation changes
-            # Positive mean change suggests the company will become more correlated with the market
-            # Negative mean change suggests it will become more independent
-            predicted_direction = 1.0 if mean_correlation_change > 0 else -1.0
+            # Analyze correlation changes for this company
+            company_idx_in_list = self.companies.index(company) if company in self.companies else 0
             
-            # Adding price deviation to the prediction
-            price_dev = price_deviations[company_idx] if company_idx < len(price_deviations) else 0.0
+            # Find significant correlation changes
+            significant_pairs = []
+            for i, other_company in enumerate(self.companies):
+                if i != company_idx_in_list:
+                    change = delta_corr[company_idx_in_list, i]
+                    if abs(change) > correlation_threshold:
+                        significant_pairs.append((other_company, float(change)))
             
-            news_analysis = {}
-            news_analysis[company] = {
-                'confidence': signal_strength, # Use correlation change magnitude as confidence
-                'predicted_changes': {
-                    '1d': predicted_direction * signal_strength * 0.02 + price_dev * 0.5,
-                    '5d': predicted_direction * signal_strength * 0.05 + price_dev * 1.0,
-                    '20d': predicted_direction * signal_strength * 0.10 + price_dev * 2.0
-                },
-                'volatility_impact': {
-                    'volatility': max_correlation_change,  # High correlation change = high volatility
-                    'volume_proxy': max_correlation_change * 0.5
-                },
+            significant_pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+            
+            # Calculate overall impact metrics
+            max_change = float(np.max(np.abs(delta_corr[company_idx_in_list, :])))
+            mean_change = float(np.mean(delta_corr[company_idx_in_list, :]))
+            
+            # Reconstruction quality as confidence
+            reconstruction_error = np.mean(np.abs(reconstruction))
+            confidence = 1.0 / (1.0 + reconstruction_error)
+            
+            # Price impact
+            price_impact = float(price_deviations[company_idx_in_list])
+            
+            # Similar companies (based on predicted correlations)
+            similar_companies = []
+            for i, other_company in enumerate(self.companies):
+                if i != company_idx_in_list:
+                    similarity = predicted_corr[company_idx_in_list, i]
+                    if similarity > 0.3:
+                        similar_companies.append((other_company, float(similarity)))
+            similar_companies.sort(key=lambda x: x[1], reverse=True)
+            
+            results[company] = {
+                'confidence': float(confidence),
                 'correlation_impact': {
-                    'max_change': max_correlation_change,
-                    'mean_change': mean_correlation_change,
-                    'significant_pairs': significant_changes[:5]
+                    'max_change': max_change,
+                    'mean_change': mean_change,
+                    'significant_pairs': significant_pairs[:10],
+                    'baseline_avg': float(np.mean(baseline_corr[company_idx_in_list, :])),
+                    'predicted_avg': float(np.mean(predicted_corr[company_idx_in_list, :]))
                 },
-                'price_deviation': price_dev,
-                'similar_companies': self.get_similar_companies_by_news_response(company, 3),
-                'reconstruction_quality': np.mean(np.abs(predictions[2][0]))
+                'price_impact': price_impact,
+                'similar_companies': similar_companies[:5],
+                # Include all matrices for advanced analysis
+                'delta_matrix': delta_corr,
+                'baseline_matrix': baseline_corr,
+                'predicted_matrix': predicted_corr,
+                'delta_z_matrix': delta_z  # Fisher-z space delta
             }
         
-        return news_analysis
+        return results
     
-    def generate_trading_signals(self, news_analysis, confidence_threshold=0.3):
+    def generate_trading_signals(self, news_analysis, confidence_threshold=0.2):
         """Generate trading signals based on correlation change predictions"""
         signals = []
         
@@ -243,12 +275,9 @@ class AdvancedTradingSystem:
                 'strength': strength,
                 'confidence': confidence,
                 'position_size': position_size,
-                'predicted_change_1d': analysis['predicted_changes']['1d'],
-                'predicted_change_5d': analysis['predicted_changes']['5d'],
-                'predicted_change_20d': analysis['predicted_changes']['20d'],
-                'volatility_impact': analysis['volatility_impact']['volatility'],
+                'volatility_impact': max_correlation_change,
                 'correlation_impact': correlation_impact,
-                'similar_companies': analysis['similar_companies'],
+                'similar_companies': analysis.get('similar_companies', []),
                 'timestamp': datetime.datetime.now()
             }
             
@@ -277,7 +306,6 @@ class AdvancedTradingSystem:
                 'type': signal['type'],
                 'size': signal['position_size'],
                 'confidence': signal['confidence'],
-                'predicted_change': signal['predicted_change_1d'],
                 'correlation_adjustment': signal.get('correlation_adjustment', 1.0),
                 'correlation_impact': signal.get('correlation_impact', {}),
                 'timestamp': signal['timestamp'],
@@ -332,7 +360,7 @@ class AdvancedTradingSystem:
     def load_model_and_data(self, path='correlation_models'):
         """Load the correlation model and associated data"""
         try:
-            self.news_model.model = tf.keras.models.load_model(
+            self.news_model.model = models.load_model(
                 os.path.join(path, 'correlation_news_model.h5')
             )
             
@@ -427,3 +455,23 @@ class AdvancedTradingSystem:
             'num_positions': n_companies,
             'correlation_pairs': len(correlations)
         }
+        
+    def _get_baseline_correlation_matrix(self):
+        """
+        Convert trading system's correlation_matrix dict to numpy matrix
+        Returns: [N, N] correlation matrix
+        """
+        n = len(self.companies)
+        matrix = np.eye(n)
+        
+        for i, company1 in enumerate(self.companies):
+            for j, company2 in enumerate(self.companies):
+                if i != j:
+                    if company1 in self.correlation_matrix and company2 in self.correlation_matrix[company1]:
+                        matrix[i, j] = self.correlation_matrix[company1][company2]
+                    elif company2 in self.correlation_matrix and company1 in self.correlation_matrix[company2]:
+                        matrix[i, j] = self.correlation_matrix[company2][company1]
+                    else:
+                        matrix[i, j] = 0.0
+        
+        return matrix

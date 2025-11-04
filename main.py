@@ -23,7 +23,6 @@ logger = logging.getLogger("AdvancedNewsFactor")
 def create_sample_data():
     """Creating enhanced sample data"""
 
-    # CSÖKKENTVE: csak 8 fő cég, hogy legyen elég hír per cég
     sample_companies = pd.DataFrame({
         'symbol': ['AAPL', 'MSFT', 'TSLA', 'NVDA', 'F', 'GM', 'NFLX', 'NIKE'],
         'name': ['Apple Inc.', 'Microsoft Corporation', 'Tesla Inc.', 'NVIDIA Corporation', 
@@ -32,7 +31,6 @@ def create_sample_data():
                    'Consumer Discretionary','Consumer Discretionary', 'Communication Services', 'Consumer Discretionary']
     })
     
-    # Közepesen hosszú hírek - elegendő kontextus, de nem túlzottan bőbeszédű
     sample_news = [
         {
             'text': 'Apple Inc. delivered stunning quarterly results with record-breaking iPhone sales that exceeded all analyst expectations. The company reported remarkable 28% year-over-year growth in its services division, including App Store, iCloud, and Apple TV+. CEO Tim Cook highlighted unprecedented demand across the entire ecosystem, with particularly strong performance in emerging international markets where Apple has been strategically investing.',
@@ -92,11 +90,8 @@ def create_sample_data():
     ]
     
     base_correlation_matrix = {
-        # Tech stocks tend to be correlated
         ('AAPL', 'MSFT'): 0.6, ('AAPL', 'NVDA'): 0.4, ('MSFT', 'NVDA'): 0.5,
-        # Auto stocks are highly correlated
         ('F', 'GM'): 0.8, ('TSLA', 'F'): 0.3, ('TSLA', 'GM'): 0.3,
-        # Cross-sector
         ('AAPL', 'TSLA'): 0.2, ('MSFT', 'TSLA'): 0.2,
         ('NIKE', 'NFLX'): 0.3, ('NIKE', 'AAPL'): 0.25
     }
@@ -139,86 +134,70 @@ def generate_realistic_prices(companies, news_events, base_correlation_matrix):
     return price_data
 
 if __name__ == "__main__":
-    logger.info("Starting correlation-based news factor trading system...")
+    logger.info("Starting RESIDUAL LEARNING correlation-based news factor trading system...")
 
     # --- Sample data & system setup ---
     companies_df, sample_news, sample_prices = create_sample_data()
     companies = list(sample_prices.keys())
-    max_keywords=100
+    max_keywords = 100
 
     embeddingAndTokenizerSystem = EmbeddingAndTokenizerSystem(companies)
     news_model = AttentionBasedNewsFactorModel(embeddingAndTokenizerSystem, max_keywords)
 
-    # --- Store static company features ---
-    for _, row in companies_df.iterrows():
-        embeddingAndTokenizerSystem.store_static_features(
-            symbol=row["symbol"],
-            fundamental_data={
-                "market_cap": np.random.uniform(1e10, 1e12),
-                "pe_ratio": np.random.uniform(10, 40),
-                "revenue_growth": np.random.uniform(-0.1, 0.3),
-                "profit_margin": np.random.uniform(0.01, 0.3),
-                "debt_to_equity": np.random.uniform(0.1, 2.0),
-                "roa": np.random.uniform(-0.05, 0.2),
-                "current_ratio": np.random.uniform(0.5, 3.0),
-                "book_value": np.random.uniform(10, 500),
-                "dividend_yield": np.random.uniform(0, 0.08),
-                "beta": np.random.uniform(0.5, 2.0),
-            },
-            price_data={
-                "volatility_30d": np.random.uniform(0.15, 0.35),
-                "return_1d": np.random.uniform(-0.05, 0.05),
-                "return_5d": np.random.uniform(-0.1, 0.1),
-                "return_20d": np.random.uniform(-0.2, 0.2),
-                "return_60d": np.random.uniform(-0.3, 0.3),
-                "volume_ratio": np.random.uniform(0.5, 2.0),
-                "momentum_score": np.random.uniform(-1, 1),
-                "rsi": np.random.uniform(20, 80),
-            },
-            sector_info={"sector": row["sector"]},
-        )
-
     # --- Trading system setup ---
     trading_system = AdvancedTradingSystem(embeddingAndTokenizerSystem, news_model, companies)
-
+    
     print("Updating correlation matrix...")
     trading_system.update_correlation_matrix(sample_prices)
     print(f"Correlation matrix: {len(trading_system.correlation_matrix)} companies")
 
-    # Show sample correlations
     if trading_system.correlation_matrix:
         print("\nSample correlations:")
         for c1 in list(trading_system.correlation_matrix)[:3]:
             for c2, corr in list(trading_system.correlation_matrix[c1].items())[:3]:
                 print(f"  {c1} <-> {c2}: {corr:.3f}")
 
-    # --- Training data ---
+    # --- TRAINING DATA WITH BASELINE CORRELATION ---
     data_processor = NewsDataProcessor(embeddingAndTokenizerSystem, news_model)
+    
+    # ✅ The processor AUTOMATICALLY calculates baseline correlation from price_data
     training_data = data_processor.process_news_batch(sample_news, sample_prices)
+    
+    # ✅ Check what's in training_data
+    print(f"\n📊 Training data prepared:")
+    print(f"  Keys: {list(training_data.keys())}")
+    print(f"  Samples: {len(training_data['keywords'])}")
+    if len(training_data['keywords']) > 0:
+        print(f"  Baseline correlation shape: {training_data['baseline_correlation'][0].shape}")
+        print(f"  Target correlation shape: {training_data['correlation_changes'][0].shape}")
+        print(f"  Baseline range (Fisher-z): [{np.min(training_data['baseline_correlation'][0]):.3f}, {np.max(training_data['baseline_correlation'][0]):.3f}]")
 
+    # --- TRAIN THE MODEL ---
     if len(training_data["keywords"]) >= 5:
-        print("Training correlation-focused model...")
+        print("\n🔥 Training residual correlation model...")
         news_model.train(training_data=training_data, epochs=20, batch_size=4)
-        print("Training completed!")
+        print("✅ Training completed!")
 
-    # --- Test news impact ---
+    # --- TEST NEWS IMPACT ---
     test_news = "Tesla reports breakthrough in battery technology, expects 50% cost reduction"
     target_companies = ["TSLA", "AAPL", "F", "GM", "NVDA"]
 
-    print(f"\nAnalyzing news: {test_news}")
+    print(f"\n📰 Analyzing news: {test_news}")
     
-    # Use the new correlation-based analysis method
+    # ⭐ Use the UPDATED analyze_news_impact (with baseline)
     news_impact = trading_system.analyze_news_impact(test_news, target_companies)
 
     for company, analysis in news_impact.items():
         print(f"\n{company}:")
         print(f"  Confidence: {analysis['confidence']:.3f}")
-        print(f"  Max Correlation Change: {analysis['correlation_impact']['max_change']:.3f}")
-        print(f"  Mean Correlation Change: {analysis['correlation_impact']['mean_change']:.3f}")
-        print(f"  Significant Correlation Pairs: {len(analysis['correlation_impact']['significant_pairs'])}")
+        print(f"  Max Correlation Change (Δ): {analysis['correlation_impact']['max_change']:.3f}")
+        print(f"  Mean Correlation Change (Δ): {analysis['correlation_impact']['mean_change']:.3f}")
+        print(f"  Baseline Avg Corr: {analysis['correlation_impact']['baseline_avg']:.3f}")
+        print(f"  Predicted Avg Corr: {analysis['correlation_impact']['predicted_avg']:.3f}")
+        print(f"  Significant Pairs: {len(analysis['correlation_impact']['significant_pairs'])}")
         if analysis['correlation_impact']['significant_pairs']:
             for other_company, corr_change in analysis['correlation_impact']['significant_pairs'][:2]:
-                print(f"    {company} <-> {other_company}: {corr_change:+.3f}")
+                print(f"    {company} <-> {other_company}: Δ={corr_change:+.3f}")
         print(f"  Similar Companies: {[comp[0] for comp in analysis['similar_companies'][:2]]}")
 
     # --- Trading signals & execution ---
@@ -227,14 +206,14 @@ if __name__ == "__main__":
     for i, s in enumerate(signals[:3], 1):
         corr_impact = s.get('correlation_impact', {})
         print(f"  Signal {i}: {s['type']} {s['company']} "
-              f"(strength={s['strength']:.3f}, corr_change={corr_impact.get('max_change', 0):.3f}, "
-              f"corr_adj={s.get('correlation_adjustment',1.0):.3f})")
+              f"(strength={s['strength']:.3f}, Δcorr={corr_impact.get('max_change', 0):.3f}, "
+              f"adj={s.get('correlation_adjustment',1.0):.3f})")
     
     trading_system.execute_trades(signals)
 
     # --- Keyword clustering ---
     if len(training_data["keywords"]) >= 5:
-        print("\nKeyword Impact Clusters:")
+        print("\n🔤 Keyword Impact Clusters:")
         test_keywords = ["breakthrough", "revenue", "profit", "loss", "acquisition", "bankruptcy", "innovation", "decline"]
         for keyword, similar_words in news_model.analyze_keyword_impact_clusters(test_keywords).items():
             if similar_words:  # Only show keywords that have similar ones
@@ -249,60 +228,51 @@ if __name__ == "__main__":
 
     # --- Portfolio & performance ---
     div = trading_system.get_portfolio_diversification_metrics()
-    print(f"\nPortfolio Diversification:\n  Score={div.get('diversification_score',0):.3f}, "
+    print(f"\n📈 Portfolio Diversification:\n  Score={div.get('diversification_score',0):.3f}, "
           f"AvgCorr={div.get('average_correlation',0):.3f}, "
           f"Positions={div.get('num_positions',0)}")
 
-    report = PerformanceAnalyzer(trading_system).generate_performance_report("correlation_performance_report.json")
-    logger.info(f"Portfolio Value: ${report['portfolio_value']:.2f}")
-    logger.info(f"Active Positions: {report['active_positions']}")
-    logger.info(f"Total Trades: {report['total_trades']}")
+    print(f"🔗 Correlation Matrix: {len(trading_system.correlation_matrix)} companies tracked")    
+    # Get baseline for analysis
+    baseline_matrix = trading_system._get_baseline_correlation_matrix()
+    baseline_z = data_processor.fisher_z_transform(baseline_matrix)
     
-    trading_system.save_model_and_data("correlation_models")
-
-    print("✅ Correlation-based system executed successfully!")
-    print(f"📊 Portfolio Value: ${report['portfolio_value']:.2f}")
-    print(f"📈 Active Positions: {report['active_positions']}")
-    print(f"🔗 Correlation Matrix: {len(trading_system.correlation_matrix)} companies tracked")
-    
-    # --- Additional correlation analysis ---
-    print("\n🔍 Correlation Learning Analysis:")
-    
-    # Get a prediction for the test news
     company_idx = embeddingAndTokenizerSystem.company_to_idx.get(target_companies[0], 0)
-    predictions = news_model.model.predict([embeddingAndTokenizerSystem.prepare_keyword_sequence(test_news, max_keywords), np.array([[company_idx]])], verbose=0)
+    keywords = embeddingAndTokenizerSystem.prepare_keyword_sequence(test_news, max_keywords)
     
-    correlation_pred = {
-        'correlation_changes': predictions[0][0],  # [N, N] matrix
-        'price_deviations': predictions[1][0],     # [N] vector
-        'reconstruction': predictions[2][0],       # [latent_dim] vector
-        'relevance_score': np.mean(np.abs(predictions[0][0])),  # average correlation change
-        'reconstruction_quality': 1.0 / (1.0 + np.mean(np.abs(predictions[2][0]))),  # the smaller the recon error, the better
-        'company_names': companies
-    }
+    predictions = news_model.model.predict([keywords, np.array([[company_idx]]), np.expand_dims(baseline_z, 0)], verbose=0)
+    predicted_corr_z = predictions[0][0]
+    delta_z = predicted_corr_z - baseline_z
     
-    print(f"  Overall relevance score: {correlation_pred['relevance_score']:.3f}")
-    print(f"  Reconstruction quality: {correlation_pred['reconstruction_quality']:.3f}")
+    # Convert to correlation space for interpretation
+    predicted_corr = data_processor.inverse_fisher_z_transform(predicted_corr_z)
+    baseline_corr = data_processor.inverse_fisher_z_transform(baseline_z)
+    delta_corr = predicted_corr - baseline_corr
     
-    # Show top correlation changes predicted by the model
-    corr_matrix = correlation_pred['correlation_changes']
-    company_names = correlation_pred['company_names']
+    print(f"  Baseline correlation (Fisher-z) range: [{baseline_z.min():.3f}, {baseline_z.max():.3f}]")
+    print(f"  Predicted correlation (Fisher-z) range: [{predicted_corr_z.min():.3f}, {predicted_corr_z.max():.3f}]")
+    print(f"  Learned delta (Fisher-z) range: [{delta_z.min():.3f}, {delta_z.max():.3f}]")
+    print(f"  Mean absolute delta: {np.abs(delta_corr).mean():.3f}")
     
-    # Find the largest correlation changes
+    # Show top changes
     significant_changes = []
-    for i in range(len(company_names)):
-        for j in range(i+1, len(company_names)):
-            if i < corr_matrix.shape[0] and j < corr_matrix.shape[1]:
-                change = corr_matrix[i, j]
-                if abs(change) > 0.05:  # Only show significant changes
-                    significant_changes.append((company_names[i], company_names[j], change))
+    for i in range(len(companies)):
+        for j in range(i+1, len(companies)):
+            if abs(delta_corr[i, j]) > 0.05:
+                significant_changes.append((
+                    companies[i], 
+                    companies[j], 
+                    delta_corr[i, j],
+                    baseline_corr[i, j],
+                    predicted_corr[i, j]
+                ))
     
-    # Sort by absolute change magnitude
     significant_changes.sort(key=lambda x: abs(x[2]), reverse=True)
     
     if significant_changes:
-        print(f"  Top predicted correlation changes:")
-        for c1, c2, change in significant_changes[:5]:
-            print(f"    {c1} <-> {c2}: {change:+.3f}")
+        print(f"\n  Top predicted correlation changes (Δ):")
+        for c1, c2, delta, baseline, predicted in significant_changes[:5]:
+            print(f"    {c1} <-> {c2}:")
+            print(f"      Baseline: {baseline:+.3f}, Predicted: {predicted:+.3f}, Δ: {delta:+.3f}")
     else:
         print("  No significant correlation changes predicted")

@@ -5,7 +5,7 @@ from scipy.stats import pearsonr
 logger = logging.getLogger("AdvancedNewsFactor.NewsDataProcessor")
 
 class NewsDataProcessor:
-    """Processing news data to train the correlation-focused model"""
+    """Processing news data for residual learning correlation model"""
     
     def __init__(self, embeddingAndTokenizerSystem, news_model):
         """Initialize the news data processor"""
@@ -17,13 +17,13 @@ class NewsDataProcessor:
 
     def fisher_z_transform(self, correlation_matrix):
         """
-        Fisher-z transzformáció korrelációs mátrixra
+        Fisher-z transformation for correlation matrix
         r → z = arctanh(r) = 0.5 * ln((1+r)/(1-r))
         
-        Előnyök:
-        - Linearizálja a korrelációkat
-        - Stabilabb varianciát ad
-        - Jobb a tanuláshoz
+        Benefits:
+        - Linearizes correlations
+        - Stabilizes variance
+        - Better for learning
         """
         # Clip to avoid numerical issues at ±1
         clipped = np.clip(correlation_matrix, -0.9999, 0.9999)
@@ -42,15 +42,29 @@ class NewsDataProcessor:
         return correlation_matrix
 
     def process_news_batch(self, news_data, price_data):
+        """
+        Process news batch for residual learning model
+        Key change: now includes baseline_correlation as input
+        """
         training_samples = {
             'keywords': [],
             'company_indices': [],
-            'correlation_changes': [],  # Fisher-z transformed
+            'baseline_correlation': [],  # NEW: Fisher-z transformed baseline
+            'correlation_changes': [],   # Target: Fisher-z transformed post-news correlation
             'price_deviations': [],
             'news_targets': []
         }
         
+        # Calculate baseline correlation ONCE for the entire dataset
+        # This represents the "normal" market state before news
         baseline_correlations = self.calculate_baseline_correlations(price_data)
+        
+        if baseline_correlations is None:
+            logger.warning("Could not calculate baseline correlations")
+            return training_samples
+        
+        # Fisher-z transform the baseline
+        baseline_z = self.fisher_z_transform(baseline_correlations)
         
         for news_item in news_data:
             news_text = news_item['text']
@@ -66,36 +80,38 @@ class NewsDataProcessor:
             if price_deviations is None:
                 continue
             
+            # Calculate POST-NEWS correlations
             post_news_correlations = self.calculate_post_news_correlations(price_data, news_timestamp)
-            correlation_changes_raw = self.calculate_correlation_change_matrix(
-                baseline_correlations, post_news_correlations
-            )
             
-            if correlation_changes_raw is None:
+            if post_news_correlations is None:
                 continue
             
-            # FISHER-Z TRANSZFORMÁCIÓ - Ez a kulcs!
-            correlation_changes = self.fisher_z_transform(correlation_changes_raw)
+            # Fisher-z transform post-news correlation
+            # This becomes our TARGET (what the model should predict)
+            post_news_z = self.fisher_z_transform(post_news_correlations)
             
-            # Use the first affected company as the primary context
+            # Use primary affected company as context
             primary_company = affected_companies[0] if affected_companies else self.embeddingAndTokenizerSystem.companies[0]
             company_idx = self.embeddingAndTokenizerSystem.company_to_idx.get(primary_company, 0)
             
+            # Store training sample
             training_samples['keywords'].append(keyword_sequence)
             training_samples['company_indices'].append(company_idx)
-            training_samples['correlation_changes'].append(correlation_changes)
+            training_samples['baseline_correlation'].append(baseline_z)  # Fisher-z baseline
+            training_samples['correlation_changes'].append(post_news_z)  # Fisher-z post-news (target)
             training_samples['price_deviations'].append(price_deviations)
             training_samples['news_targets'].append(news_targets)
         
-        logger.info(f"Processed {len(training_samples['keywords'])} news items (Fisher-z transformed)")
+        logger.info(f"Processed {len(training_samples['keywords'])} news items with residual learning setup")
+        logger.info(f"Baseline correlation range (Fisher-z): [{baseline_z.min():.3f}, {baseline_z.max():.3f}]")
+        
         return training_samples
 
     def calculate_price_deviations(self, price_data, news_timestamp, baseline_correlations, affected_companies, window_days=5):
-        """Számítja az árfolyamváltozások eltérését a korrelációk alapján várttól"""
+        """Calculate price deviations from correlation-based expectations"""
         companies = list(price_data.keys())
         deviations = np.zeros(len(companies))
         
-        # Tényleges hozamok minden cégre
         actual_returns = {}
         for company in companies:
             sorted_prices = sorted(price_data[company].items())
@@ -113,12 +129,12 @@ class NewsDataProcessor:
         if not actual_returns:
             return None
         
-        # Deviációk számítása
+        # Calculate deviations
         for i, company in enumerate(companies):
             if company not in actual_returns:
                 continue
             
-            # Korreláció alapján várt hozam
+            # Expected return based on correlations
             expected_return = 0.0
             weight_sum = 0.0
             
@@ -133,16 +149,18 @@ class NewsDataProcessor:
             if weight_sum > 0.01:
                 expected_return /= weight_sum
             
-            # Deviáció = tényleges - várt
             deviations[i] = actual_returns[company] - expected_return
         
         return deviations
     
     def calculate_baseline_correlations(self, price_data, lookback_days=30):
-        """Calculate baseline correlation matrix using historical price data"""
+        """
+        Calculate baseline correlation matrix using historical price data
+        This represents the 'normal' market correlation structure
+        """
         companies = list(price_data.keys())
         num_companies = len(companies)
-        correlation_matrix = np.zeros((num_companies, num_companies))
+        correlation_matrix = np.eye(num_companies)
         
         # Get historical returns for all companies
         company_returns = {}
@@ -171,7 +189,7 @@ class NewsDataProcessor:
                         aligned_returns2 = returns2[-min_len:]
                         
                         try:
-                            correlation, p_value = pearsonr(aligned_returns1, aligned_returns2)
+                            correlation, _ = pearsonr(aligned_returns1, aligned_returns2)
                             if not np.isnan(correlation):
                                 correlation_matrix[i, j] = correlation
                         except:
@@ -182,10 +200,13 @@ class NewsDataProcessor:
         return correlation_matrix
     
     def calculate_post_news_correlations(self, price_data, news_timestamp, window_days=5):
-        """Calculate correlations in the period after news announcement"""
+        """
+        Calculate correlations in the period AFTER news announcement
+        This captures the NEWS-INDUCED correlation structure
+        """
         companies = list(price_data.keys())
         num_companies = len(companies)
-        correlation_matrix = np.zeros((num_companies, num_companies))
+        correlation_matrix = np.eye(num_companies)
         
         # Get post-news returns
         company_returns = {}
@@ -225,7 +246,7 @@ class NewsDataProcessor:
                         aligned_returns2 = returns2[-min_len:]
                         
                         try:
-                            correlation, p_value = pearsonr(aligned_returns1, aligned_returns2)
+                            correlation, _ = pearsonr(aligned_returns1, aligned_returns2)
                             if not np.isnan(correlation):
                                 correlation_matrix[i, j] = correlation
                         except:
@@ -235,8 +256,15 @@ class NewsDataProcessor:
         
         return correlation_matrix
     
-    def calculate_correlation_change_matrix(self, baseline_correlations, post_news_correlations):
-        """Calculate the change in correlation matrix after news"""
+    def calculate_correlation_delta(self, baseline_correlations, post_news_correlations):
+        """
+        Calculate the NEWS-INDUCED CHANGE in correlations
+        This is what the residual model will learn to predict
+        
+        NOTE: In the residual model, we don't use this directly anymore.
+        Instead, we feed baseline as input and post-news as target.
+        The model learns: delta = target - baseline
+        """
         if baseline_correlations is None or post_news_correlations is None:
             return None
         
@@ -245,17 +273,14 @@ class NewsDataProcessor:
             logger.warning("Correlation matrices have different shapes")
             return None
         
-        # Calculate the difference (még NEM Fisher-z transformed)
-        correlation_changes = post_news_correlations - baseline_correlations
+        # The delta in Fisher-z space
+        delta = post_news_correlations - baseline_correlations
         
-        # Apply smoothing to reduce noise in correlation changes
-        # Cap extreme changes to prevent training instability
-        correlation_changes = np.clip(correlation_changes, -0.8, 0.8)
-        
-        # Ensure diagonal remains zero (no self-correlation change)
-        np.fill_diagonal(correlation_changes, 0.0)
+        # Smoothing and stability
+        delta = np.clip(delta, -0.8, 0.8)
+        np.fill_diagonal(delta, 0.0)
         
         # Ensure symmetry
-        correlation_changes = (correlation_changes + correlation_changes.T) / 2.0
+        delta = (delta + delta.T) / 2.0
         
-        return correlation_changes
+        return delta

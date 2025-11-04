@@ -22,7 +22,6 @@ class EmbeddingAndTokenizerSystem:
         self.idx_to_word = {v: k for k, v in self.word_to_idx.items()}
         
         # Static features for initialization only
-        self.static_features = {}
         self.news_embeddings = []
         self.news_metadata = []
         
@@ -52,51 +51,6 @@ class EmbeddingAndTokenizerSystem:
                 del self._bert_cache[key]
         
         return embedding
-    
-    def store_static_features(self, symbol, fundamental_data=None, price_data=None, sector_info=None):
-        """Store static features for company (used for embedding layer initialization)"""
-        features = {}
-        
-        if fundamental_data:
-            fundamental_features = np.array([
-                fundamental_data.get('market_cap', 0),
-                fundamental_data.get('pe_ratio', 15),
-                fundamental_data.get('revenue_growth', 0),
-                fundamental_data.get('profit_margin', 0.1),
-                fundamental_data.get('debt_to_equity', 0.5),
-                fundamental_data.get('roa', 0.05),
-                fundamental_data.get('current_ratio', 1.5),
-                fundamental_data.get('book_value', 100),
-                fundamental_data.get('dividend_yield', 0.02),
-                fundamental_data.get('beta', 1.0)
-            ])
-            features['fundamental'] = fundamental_features
-        
-        if price_data:
-            price_features = np.array([
-                price_data.get('volatility_30d', 0.2),
-                price_data.get('return_1d', 0),
-                price_data.get('return_5d', 0),
-                price_data.get('return_20d', 0),
-                price_data.get('return_60d', 0),
-                price_data.get('volume_ratio', 1.0),
-                price_data.get('momentum_score', 0),
-                price_data.get('rsi', 50)
-            ])
-            features['price'] = price_features
-        
-        if sector_info:
-            sectors = ['Technology', 'Healthcare', 'Financials', 'Energy', 
-                      'Consumer Discretionary', 'Industrials', 'Consumer Staples',
-                      'Materials', 'Real Estate', 'Utilities', 'Communication Services']
-            
-            sector_vector = np.zeros(len(sectors))
-            if sector_info.get('sector') in sectors:
-                sector_idx = sectors.index(sector_info['sector'])
-                sector_vector[sector_idx] = 1.0
-            features['sector'] = sector_vector
-            
-        self.static_features[symbol] = features
     
     def prepare_keyword_sequence(self, text, max_length):
         inputs = self.tokenizer(
