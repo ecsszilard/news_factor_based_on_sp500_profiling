@@ -20,13 +20,6 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
 volumes:
   jupyter_data:

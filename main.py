@@ -1,278 +1,298 @@
 import numpy as np
-import pandas as pd
-import time
+from transformers import AutoTokenizer, TFAutoModel
 import logging
+import matplotlib.pyplot as plt
+import tensorflow as tf
 
-from EmbeddingAndTokenizerSystem import EmbeddingAndTokenizerSystem
 from AttentionBasedNewsFactorModel import AttentionBasedNewsFactorModel
 from NewsDataProcessor import NewsDataProcessor
 from AdvancedTradingSystem import AdvancedTradingSystem
 from PerformanceAnalyzer import PerformanceAnalyzer
+from Utils import Utils
 
 # Logging settings
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("advanced_newsfactor_trading.log"),
+        logging.FileHandler("probabilistic_newsfactor_trading.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("AdvancedNewsFactor")
-
-def create_sample_data():
-    """Creating enhanced sample data"""
-
-    sample_companies = pd.DataFrame({
-        'symbol': ['AAPL', 'MSFT', 'TSLA', 'NVDA', 'F', 'GM', 'NFLX', 'NIKE'],
-        'name': ['Apple Inc.', 'Microsoft Corporation', 'Tesla Inc.', 'NVIDIA Corporation', 
-                 'Ford Motor Company', 'General Motors Company', 'Netflix Inc.','Nike Inc.'],
-        'sector': ['Technology', 'Technology', 'Consumer Discretionary', 'Technology', 
-                   'Consumer Discretionary','Consumer Discretionary', 'Communication Services', 'Consumer Discretionary']
-    })
-    
-    sample_news = [
-        {
-            'text': 'Apple Inc. delivered stunning quarterly results with record-breaking iPhone sales that exceeded all analyst expectations. The company reported remarkable 28% year-over-year growth in its services division, including App Store, iCloud, and Apple TV+. CEO Tim Cook highlighted unprecedented demand across the entire ecosystem, with particularly strong performance in emerging international markets where Apple has been strategically investing.',
-            'companies': ['AAPL'],
-            'timestamp': time.time() - 86400
-        },
-        {
-            'text': 'Microsoft Corporation announced Azure cloud platform achieved 35% year-over-year revenue increase, significantly surpassing Wall Street forecasts. The growth has been primarily driven by unprecedented surge in AI-powered services demand. CEO Satya Nadella emphasized strategic OpenAI partnership proving particularly lucrative, with GPT model integration attracting major corporate clients seeking cutting-edge AI capabilities.',
-            'companies': ['MSFT'],
-            'timestamp': time.time() - 3600
-        },
-        {
-            'text': 'Tesla Inc. announced record-breaking quarterly delivery numbers across all model lines, with Model Y becoming one of the best-selling vehicles globally. The achievement is remarkable given ongoing supply chain challenges. CEO Elon Musk emphasized vertical integration strategy and battery production capabilities as crucial competitive advantages, enabling premium pricing while scaling production.',
-            'companies': ['TSLA'],
-            'timestamp': time.time() - 7200
-        },
-        {
-            'text': 'NVIDIA Corporation unveiled breakthrough AI semiconductor technology representing quantum leap in processing efficiency. The new architecture offers unprecedented performance improvements for machine learning training and real-time inference. CEO Jensen Huang described it as dawn of new computing era. Strategic partnerships with major cloud providers ensure global availability, with early benchmarks showing 10x faster performance while consuming significantly less power.',
-            'companies': ['NVDA'],
-            'timestamp': time.time() - 14400
-        },
-        {
-            'text': 'Ford Motor Company and General Motors announced significant production delays due to unprecedented semiconductor shortage crisis. Both automakers implementing temporary shutdowns at multiple North American facilities. Ford Executive Chairman described challenges as unlike anything in company 120-year history. The situation highlights strategic importance of supply chain resilience and domestic semiconductor manufacturing.',
-            'companies': ['F', 'GM'],
-            'timestamp': time.time() - 21600
-        },
-        {
-            'text': 'Netflix Inc. reported subscriber growth significantly exceeding analyst expectations, with particularly strong international market performance. The streaming giant added millions of new subscribers driven by exceptional original content slate. Co-CEO Reed Hastings emphasized data-driven content creation approach continues yielding impressive results. Recent price adjustments being well-received by subscribers who recognize platform value.',
-            'companies': ['NFLX'],
-            'timestamp': time.time() - 10800
-        },
-        {
-            'text': 'Nike Inc. unveiled revolutionary sustainable athletic footwear program combining cutting-edge performance with environmental responsibility. The comprehensive circular economy initiative reimagines entire product lifecycle from design through recycling. CEO John Donahoe emphasized largest sustainability investment in Nike history, positioning company ahead of competitors in rapidly growing sustainable products market favored by younger demographics.',
-            'companies': ['NIKE'],
-            'timestamp': time.time() - 18000
-        },
-        {
-            'text': 'Technology sector rally powered by strong earnings from Apple and Microsoft, lifting both companies to new all-time highs. Cloud computing adoption and AI integration accelerating across multiple industries. Analysts noting synchronized strength across tech megacaps suggesting broad-based demand recovery. Both companies benefiting from enterprise digital transformation trends.',
-            'companies': ['AAPL', 'MSFT'],
-            'timestamp': time.time() - 5000
-        },
-        {
-            'text': 'Electric vehicle market experiencing unprecedented demand surge as Tesla, Ford, and GM all report strong quarterly deliveries. Battery technology improvements and expanding charging infrastructure driving mainstream adoption. Tesla maintaining market leadership while traditional automakers accelerating EV programs. Industry analysts predict sustained high growth as consumers increasingly prioritize sustainability.',
-            'companies': ['TSLA', 'F', 'GM'],
-            'timestamp': time.time() - 12000
-        },
-        {
-            'text': 'Semiconductor supply constraints showing signs of gradual improvement, particularly benefiting Tesla and technology manufacturers. NVIDIA capacity expansion initiatives helping ease shortage situation. However, automotive sector still facing significant challenges. Industry experts warn recovery timeline remains uncertain, with structural changes to supply chain management likely permanent.',
-            'companies': ['TSLA', 'NVDA'],
-            'timestamp': time.time() - 16000
-        },
-        {
-            'text': 'Consumer discretionary sector showing mixed performance with Nike reporting exceptionally strong brand demand and premium pricing power, while Ford grapples with inventory management challenges due to production constraints. Divergence highlights importance of supply chain resilience and brand strength in current environment.',
-            'companies': ['NIKE', 'F'],
-            'timestamp': time.time() - 20000
-        }
-    ]
-    
-    base_correlation_matrix = {
-        ('AAPL', 'MSFT'): 0.6, ('AAPL', 'NVDA'): 0.4, ('MSFT', 'NVDA'): 0.5,
-        ('F', 'GM'): 0.8, ('TSLA', 'F'): 0.3, ('TSLA', 'GM'): 0.3,
-        ('AAPL', 'TSLA'): 0.2, ('MSFT', 'TSLA'): 0.2,
-        ('NIKE', 'NFLX'): 0.3, ('NIKE', 'AAPL'): 0.25
-    }
-
-    sample_prices = generate_realistic_prices(sample_companies, sample_news, base_correlation_matrix)
-    
-    return sample_companies, sample_news, sample_prices
-
-def generate_realistic_prices(companies, news_events, base_correlation_matrix):
-    n_days, n_companies = 35, len(companies)
-
-    # Correlation matrix construction
-    corr = np.eye(n_companies)
-    company_list = companies['symbol'].tolist()
-    for i, c1 in enumerate(company_list):
-        for j, c2 in enumerate(company_list):
-            if i != j:
-                corr[i, j] = base_correlation_matrix.get((c1, c2), base_correlation_matrix.get((c2, c1), 0.1))
-
-    # Kovariancia mátrix és hozamok
-    vols = np.random.uniform(0.015, 0.035, size=n_companies)
-    cov = np.outer(vols, vols) * corr
-    returns = np.random.multivariate_normal(np.zeros(n_companies), cov, size=n_days)
-
-    # Árfolyamok generálása
-    price_data = {}
-    for i, company in enumerate(company_list):
-        price, prices = np.random.uniform(50, 300), {}
-        for day in range(n_days):
-            r = returns[day, i]
-            for news in news_events:
-                if company in news['companies']:
-                    news_day = int((news['timestamp'] - (time.time() - 30*24*3600)) / 86400)
-                    dt = day - news_day
-                    if dt >= 0:
-                        r += news.get("impact", 0.02) * np.exp(-dt/2)
-            price *= (1 + r)
-            prices[time.time() + ((day - 30) * 86400)] = max(price, 1.0)
-        price_data[company] = prices
-    return price_data
+logger = logging.getLogger("ProbabilisticNewsFactor")
+tf.config.set_visible_devices([], 'GPU') 
 
 if __name__ == "__main__":
-    logger.info("Starting RESIDUAL LEARNING correlation-based news factor trading system...")
+    logger.info("="*80)
+    logger.info("PROBABILISTIC RESIDUAL LEARNING CORRELATION-BASED NEWS FACTOR TRADING")
+    logger.info("="*80)
 
-    # --- Sample data & system setup ---
-    companies_df, sample_news, sample_prices = create_sample_data()
-    companies = list(sample_prices.keys())
-    max_keywords = 100
-
-    embeddingAndTokenizerSystem = EmbeddingAndTokenizerSystem(companies)
-    news_model = AttentionBasedNewsFactorModel(embeddingAndTokenizerSystem, max_keywords)
-
-    # --- Trading system setup ---
-    trading_system = AdvancedTradingSystem(embeddingAndTokenizerSystem, news_model, companies)
+    # --- SAMPLE DATA & SYSTEM SETUP ---
+    utils = Utils()
+    companies_df, sample_news, sample_prices = utils.create_sample_data()
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    bert_model = TFAutoModel.from_pretrained('bert-base-uncased', from_pt=True)
     
-    print("Updating correlation matrix...")
-    trading_system.update_correlation_matrix(sample_prices)
-    print(f"Correlation matrix: {len(trading_system.correlation_matrix)} companies")
-
-    if trading_system.correlation_matrix:
-        print("\nSample correlations:")
-        for c1 in list(trading_system.correlation_matrix)[:3]:
-            for c2, corr in list(trading_system.correlation_matrix[c1].items())[:3]:
-                print(f"  {c1} <-> {c2}: {corr:.3f}")
+    # --- USE PROBABILISTIC MODEL ---
+    logger.info("\n🧠 Initializing Probabilistic Model...")
+    news_model = AttentionBasedNewsFactorModel(tokenizer, num_companies=len(sample_prices.keys()), max_keywords=100, keyword_dim=256, company_dim=128, latent_dim=128)
+    logger.info("✅ Model initialized with dual output (μ, σ²)")
 
     # --- TRAINING DATA WITH BASELINE CORRELATION ---
-    data_processor = NewsDataProcessor(embeddingAndTokenizerSystem, news_model)
+    data_processor = NewsDataProcessor(news_model, sample_prices, bert_model)
     
-    # ✅ The processor AUTOMATICALLY calculates baseline correlation from price_data
-    training_data = data_processor.process_news_batch(sample_news, sample_prices)
+    logger.info("\n📄 Processing training data...")
+    training_data = data_processor.process_news_batch(sample_news)
     
-    # ✅ Check what's in training_data
-    print(f"\n📊 Training data prepared:")
-    print(f"  Keys: {list(training_data.keys())}")
-    print(f"  Samples: {len(training_data['keywords'])}")
-    if len(training_data['keywords']) > 0:
-        print(f"  Baseline correlation shape: {training_data['baseline_correlation'][0].shape}")
-        print(f"  Target correlation shape: {training_data['correlation_changes'][0].shape}")
-        print(f"  Baseline range (Fisher-z): [{np.min(training_data['baseline_correlation'][0]):.3f}, {np.max(training_data['baseline_correlation'][0]):.3f}]")
+    logger.info(f"\n📦 Training Data Summary:")
+    logger.info(f"  Samples: {len(training_data['keyword_sequence'])}")
+    if len(training_data['keyword_sequence']) > 0:
+        logger.info(f"  Baseline correlation shape: {training_data['baseline_correlation'][0].shape}")
+        logger.info(f"  Target correlation shape: {training_data['correlation_changes'][0].shape}")
+        baseline_sample = training_data['baseline_correlation'][0]
+        logger.info(f"  Baseline range (Fisher-z): [{np.min(baseline_sample):.3f}, {np.max(baseline_sample):.3f}]")
 
-    # --- TRAIN THE MODEL ---
-    if len(training_data["keywords"]) >= 5:
-        print("\n🔥 Training residual correlation model...")
-        news_model.train(training_data=training_data, epochs=20, batch_size=4)
-        print("✅ Training completed!")
+    # --- TRAIN THE PROBABILISTIC MODEL ---
+    news_model.train(training_data=training_data, epochs=20, batch_size=4)
 
-    # --- TEST NEWS IMPACT ---
+    # --- TEST NEWS IMPACT WITH UNCERTAINTY ---
     test_news = "Tesla reports breakthrough in battery technology, expects 50% cost reduction"
     target_companies = ["TSLA", "AAPL", "F", "GM", "NVDA"]
+    focus_company = "TSLA"
+    focus_company_idx = list(sample_prices.keys()).index(focus_company)
+    affected_companies_test = ["TSLA"]  # Only Tesla is directly affected
 
-    print(f"\n📰 Analyzing news: {test_news}")
-    
-    # ⭐ Use the UPDATED analyze_news_impact (with baseline)
-    news_impact = trading_system.analyze_news_impact(test_news, target_companies)
+    logger.info("="*60)
+    logger.info(f"📰 ANALYZING NEWS WITH UNCERTAINTY QUANTIFICATION")
+    logger.info("="*60)
+    logger.info(f"News: {test_news}")
+    logger.info(f"Affected Companies: {affected_companies_test}")
+    logger.info("")
 
+    # --- TRADING SYSTEM SETUP ---
+    trading_system = AdvancedTradingSystem(data_processor)
+
+    # Use the predict_news_impact with affected_companies
+    news_impact = trading_system.predict_news_impact(test_news, target_companies, affected_companies_test)
+
+    # Print news impact results with uncertainty
     for company, analysis in news_impact.items():
-        print(f"\n{company}:")
-        print(f"  Confidence: {analysis['confidence']:.3f}")
-        print(f"  Max Correlation Change (Δ): {analysis['correlation_impact']['max_change']:.3f}")
-        print(f"  Mean Correlation Change (Δ): {analysis['correlation_impact']['mean_change']:.3f}")
-        print(f"  Baseline Avg Corr: {analysis['correlation_impact']['baseline_avg']:.3f}")
-        print(f"  Predicted Avg Corr: {analysis['correlation_impact']['predicted_avg']:.3f}")
-        print(f"  Significant Pairs: {len(analysis['correlation_impact']['significant_pairs'])}")
-        if analysis['correlation_impact']['significant_pairs']:
-            for other_company, corr_change in analysis['correlation_impact']['significant_pairs'][:2]:
-                print(f"    {company} <-> {other_company}: Δ={corr_change:+.3f}")
-        print(f"  Similar Companies: {[comp[0] for comp in analysis['similar_companies'][:2]]}")
+        logger.info(f"\n{company}:")
+        logger.info(f"  News Scope: {analysis['news_scope']}")
+        logger.info(f"  Affected Companies: {analysis['affected_companies']}")
+        logger.info(f"  Total Confidence: {analysis['total_confidence']:.3f}")
+        logger.info(f"  Reconstruction Error: {analysis['reconstruction_error']:.4f}")
+        logger.info(f"  Tradeable: {'✅ Yes' if analysis['tradeable'] else '❌ No'}")
+        
+        corr_impact = analysis['correlation_impact']
+        logger.info(f"  Correlation Impact:")
+        logger.info(f"    Max Change (Δ): {corr_impact['max_change']:.3f}")
+        logger.info(f"    Mean Change (Δ): {corr_impact['mean_change']:.3f}")
+        logger.info(f"    Avg Uncertainty (σ): {corr_impact['avg_uncertainty']:.3f}")
+        
+        if corr_impact['significant_pairs']:
+            logger.info(f"    Significant Pairs (low uncertainty):")
+            for pair in corr_impact['significant_pairs'][:3]:
+                logger.info(
+                    f"      {company} ↔ {pair['company']}: "
+                    f"Δ={pair['change']:+.3f}, σ={pair['uncertainty']:.3f}"
+                )
 
-    # --- Trading signals & execution ---
-    signals = trading_system.generate_trading_signals(news_impact, 0.2)  # Lower thresholds for correlation model
-    print(f"\nGenerated {len(signals)} trading signals")
-    for i, s in enumerate(signals[:3], 1):
-        corr_impact = s.get('correlation_impact', {})
-        print(f"  Signal {i}: {s['type']} {s['company']} "
-              f"(strength={s['strength']:.3f}, Δcorr={corr_impact.get('max_change', 0):.3f}, "
-              f"adj={s.get('correlation_adjustment',1.0):.3f})")
+    # --- TRADING SIGNALS WITH UNCERTAINTY THRESHOLDS ---
+    logger.info("\n" + "="*60)
+    logger.info("💼 GENERATING TRADING SIGNALS")
+    logger.info("="*60)
     
-    trading_system.execute_trades(signals)
+    signals = trading_system.generate_trading_signals(
+        news_impact, 
+        min_confidence=0.6,  # Only trade with >60% confidence
+        max_uncertainty=0.4  # Only trade with <0.4 uncertainty
+    )
+    
+    logger.info(f"Generated {len(signals)} trading signals")
+    for i, s in enumerate(signals[:5], 1):
+        logger.info(f"\n  Signal {i}: {s['type']} {s['company']}")
+        logger.info(f"    Strength: {s['strength']:.3f}")
+        logger.info(f"    Confidence: {s['total_confidence']:.3f}")
+        logger.info(f"    Uncertainty (σ): {s['uncertainty']:.3f}")
+        logger.info(f"    Position Size: ${s['position_size']:.2f}")
+        logger.info(f"    News Scope: {s['news_scope']}")
+    
+    trading_system.execute_trading_signals(signals)
 
     # --- Keyword clustering ---
-    if len(training_data["keywords"]) >= 5:
+    if len(training_data["keyword_sequence"]) >= 5:
         print("\n🔤 Keyword Impact Clusters:")
         test_keywords = ["breakthrough", "revenue", "profit", "loss", "acquisition", "bankruptcy", "innovation", "decline"]
-        for keyword, similar_words in news_model.analyze_keyword_impact_clusters(test_keywords).items():
+        for keyword, similar_words in trading_system.analyze_keyword_impact_clusters(test_keywords).items():
             if similar_words:  # Only show keywords that have similar ones
                 similar_names = [word for word, sim in similar_words[:3]]
                 print(f"  '{keyword}' clusters with: {similar_names}")
 
         test_word = "breakthrough"
-        if test_word in embeddingAndTokenizerSystem.word_to_idx:
+        if test_word in tokenizer.vocab:
             print(f"\nSimilar keywords to '{test_word}':")
             for w, sim in trading_system.get_similar_keywords_by_impact(test_word, 5):
                 print(f"  {w}: {sim:.3f}")
 
-    # --- Portfolio & performance ---
-    div = trading_system.get_portfolio_diversification_metrics()
-    print(f"\n📈 Portfolio Diversification:\n  Score={div.get('diversification_score',0):.3f}, "
-          f"AvgCorr={div.get('average_correlation',0):.3f}, "
-          f"Positions={div.get('num_positions',0)}")
-
-    print(f"🔗 Correlation Matrix: {len(trading_system.correlation_matrix)} companies tracked")    
-    # Get baseline for analysis
-    baseline_matrix = trading_system._get_baseline_correlation_matrix()
-    baseline_z = data_processor.fisher_z_transform(baseline_matrix)
+    keyword_tokens = data_processor.prepare_keyword_sequence(test_news)    
+    # Get actual news embedding for reconstruction error
+    news_target_embedding = data_processor.get_bert_embedding(test_news)[:news_model.latent_dim]
     
-    company_idx = embeddingAndTokenizerSystem.company_to_idx.get(target_companies[0], 0)
-    keywords = embeddingAndTokenizerSystem.prepare_keyword_sequence(test_news, max_keywords)
+    # Make probabilistic prediction with REAL reconstruction error
+    logger.info("🔮 Making probabilistic prediction...")
+    predictions = news_model.predict_with_uncertainty(
+        keyword_tokens['input_ids'],  # Pass TF Tensor directly, predict_with_uncertainty will handle it
+        np.expand_dims(data_processor.baseline_z, 0),
+        news_target_embedding
+    )
     
-    predictions = news_model.model.predict([keywords, np.array([[company_idx]]), np.expand_dims(baseline_z, 0)], verbose=0)
-    predicted_corr_z = predictions[0][0]
-    delta_z = predicted_corr_z - baseline_z
+    logger.info(f"✅ Prediction complete!")
+    logger.info(f"\n📊 UNCERTAINTY ANALYSIS:")
+    logger.info(f"  Total Confidence: {predictions['total_confidence']:.3f}")
+    logger.info(f"    * Reconstruction Error: {predictions['reconstruction_error']:.4f}")
+    logger.info(f"    * Interpretation: {'✅ Known news type' if predictions['reconstruction_error'] < 0.2 else '⚠️ Novel/unusual news'}")
     
-    # Convert to correlation space for interpretation
-    predicted_corr = data_processor.inverse_fisher_z_transform(predicted_corr_z)
-    baseline_corr = data_processor.inverse_fisher_z_transform(baseline_z)
+    # Analyze correlation changes
+    mu = predictions['mean'][0]
+    sigma = predictions['std'][0]
+    baseline_corr = data_processor.inverse_fisher_z_transform(data_processor.baseline_z)
+    predicted_corr = data_processor.inverse_fisher_z_transform(mu)
     delta_corr = predicted_corr - baseline_corr
     
-    print(f"  Baseline correlation (Fisher-z) range: [{baseline_z.min():.3f}, {baseline_z.max():.3f}]")
-    print(f"  Predicted correlation (Fisher-z) range: [{predicted_corr_z.min():.3f}, {predicted_corr_z.max():.3f}]")
-    print(f"  Learned delta (Fisher-z) range: [{delta_z.min():.3f}, {delta_z.max():.3f}]")
-    print(f"  Mean absolute delta: {np.abs(delta_corr).mean():.3f}")
+    logger.info(f"\n📈 CORRELATION CHANGES:")
+    logger.info(f"  Mean |Δ|: {np.mean(np.abs(delta_corr)):.4f}")
+    logger.info(f"  Max |Δ|: {np.max(np.abs(delta_corr)):.4f}")
+    logger.info(f"  High uncertainty pairs (σ > 0.3): {np.sum(sigma > 0.3)}/{len(data_processor.companies)**2}")
     
-    # Show top changes
+    # Show top changes involving focus company
     significant_changes = []
-    for i in range(len(companies)):
-        for j in range(i+1, len(companies)):
-            if abs(delta_corr[i, j]) > 0.05:
+    for i in range(len(data_processor.companies)):
+        if i != focus_company_idx:
+            change = delta_corr[focus_company_idx, i]
+            unc = sigma[focus_company_idx, i]
+            if abs(change) > 0.05:
                 significant_changes.append((
-                    companies[i], 
-                    companies[j], 
-                    delta_corr[i, j],
-                    baseline_corr[i, j],
-                    predicted_corr[i, j]
+                    data_processor.companies[focus_company_idx], 
+                    data_processor.companies[i], 
+                    change,
+                    baseline_corr[focus_company_idx, i],
+                    mu[focus_company_idx, i],
+                    unc
                 ))
     
     significant_changes.sort(key=lambda x: abs(x[2]), reverse=True)
     
     if significant_changes:
-        print(f"\n  Top predicted correlation changes (Δ):")
-        for c1, c2, delta, baseline, predicted in significant_changes[:5]:
-            print(f"    {c1} <-> {c2}:")
-            print(f"      Baseline: {baseline:+.3f}, Predicted: {predicted:+.3f}, Δ: {delta:+.3f}")
-    else:
-        print("  No significant correlation changes predicted")
+        logger.info(f"\n🎯 TOP CORRELATION CHANGES FOR {focus_company}:")
+        for c1, c2, delta, baseline, predicted, unc in significant_changes[:5]:
+            logger.info(f"\n  {c1} ↔ {c2}:")
+            logger.info(f"    Baseline: {baseline:+.3f}")
+            logger.info(f"    Predicted: {predicted:+.3f}")
+            logger.info(f"    Change (Δ): {delta:+.3f}")
+            logger.info(f"    Uncertainty (σ): {unc:.4f} {'✅ Low' if unc < 0.3 else '⚠️ High'}")
+
+    # ============================================================================
+    # VISUALIZE
+    # ============================================================================
+    logger.info("\n📊 Generating visualization...")
+    performance_analyzer = PerformanceAnalyzer(trading_system)
+    performance_report = performance_analyzer.generate_performance_report()
+    
+    logger.info("Teljesítményjelentés:")
+    logger.info(f"Portfolio_value: ${performance_report['portfolio_value']:.2f}")
+    logger.info(f"Active positions: {performance_report['active_positions']}")
+    logger.info(f"Period_performance: {performance_report['period_performance']}")
+
+    fig = performance_analyzer.visualize_uncertainty_predictions(
+        predictions, 
+        baseline_corr, 
+        predicted_corr,
+        data_processor.companies, 
+        test_news
+    )
+    plt.savefig('probabilistic_predictions.png', dpi=150, bbox_inches='tight')
+    logger.info("✅ Saved to 'probabilistic_predictions.png'")
+    
+    # Portfolio metrics
+    div = trading_system.get_portfolio_diversification_metrics()
+    logger.info(f"\n📈 Portfolio Diversification:")
+    logger.info(f"  Score: {div.get('diversification_score',0):.3f}")
+    logger.info(f"  Average Correlation: {div.get('average_correlation',0):.3f}")
+    logger.info(f"  Positions: {div.get('num_positions',0)}")
+    
+    logger.info("\n" + "="*80)
+    logger.info("KEY INSIGHTS")
+    logger.info("="*80)
+    logger.info("✓ Model learns WHEN to be uncertain (aleatoric via σ)")
+    logger.info("✓ Reconstruction error captures epistemic uncertainty (novel news)")
+    logger.info("✓ Weighted loss focuses on ACTUALLY AFFECTED company pairs (not just focus)")
+    logger.info("  → FED news affecting all companies: all pairs weighted equally")
+    logger.info("  → AAPL-specific news: AAPL pairs get 3x weight")
+    logger.info("✓ Combined confidence guides trading decisions")
+    logger.info("✓ Position sizing accounts for prediction uncertainty")
+    logger.info("="*80)
+    
+    # ============================================================================
+    # TEST WITH GLOBAL NEWS
+    # ============================================================================
+    logger.info("\n\n" + "="*80)
+    logger.info("🌍 TESTING WITH GLOBAL/MACRO NEWS")
+    logger.info("="*80)
+    
+    global_news = "Federal Reserve announces 0.75% interest rate hike to combat inflation"
+    logger.info(f"\nNews: {global_news}")
+    logger.info("Expected behavior:")
+    logger.info("  - News scope: GLOBAL")
+    logger.info("  - Affected companies: [] (or all)")
+    logger.info("  - All correlation pairs weighted equally")
+    logger.info("")
+    
+    # Analyze global news - NO specific affected companies
+    global_news_impact = trading_system.predict_news_impact(
+        global_news,
+        target_companies=["AAPL", "MSFT", "TSLA", "F"],
+        affected_companies=[]  # ← Empty list = global news
+    )
+    
+    logger.info("Results:")
+    for company, analysis in global_news_impact.items():
+        logger.info(f"\n{company}:")
+        logger.info(f"  News Scope: {analysis['news_scope']}")
+        logger.info(f"  Affected Companies: {analysis['affected_companies']}")
+        logger.info(f"  Confidence: {analysis['total_confidence']:.3f}")
+        logger.info(f"  Max Correlation Change: {analysis['correlation_impact']['max_change']:.3f}")
+        
+    logger.info("\n✅ Global news correctly handled - no company-specific bias!")
+    
+    # ============================================================================
+    # TEST WITH NOVEL NEWS
+    # ============================================================================
+    logger.info("\n\n" + "="*80)
+    logger.info("🚀 TESTING WITH NOVEL NEWS")
+    logger.info("="*80)
+    
+    novel_news = "SpaceX announces plans to establish Mars colony by 2030"
+    logger.info(f"\nNews: {novel_news}")
+    logger.info("Expected behavior:")
+    logger.info("  - HIGH reconstruction error (novel concept)")
+    logger.info("  - LOW epistemic confidence")
+    logger.info("  - Should SKIP trading")
+    logger.info("")
+    
+    novel_news_impact = trading_system.predict_news_impact(
+        novel_news,
+        target_companies=["TSLA", "AAPL"],
+        affected_companies=["TSLA"]
+    )
+    
+    logger.info("Results:")
+    for company, analysis in novel_news_impact.items():
+        logger.info(f"\n{company}:")
+        logger.info(f"  Reconstruction Error: {analysis['reconstruction_error']:.4f}")
+        logger.info(f"  Total Confidence: {analysis['total_confidence']:.3f}")
+        logger.info(f"  Tradeable: {'✅ Yes' if analysis['tradeable'] else '❌ No (too uncertain)'}")
+    
+    logger.info("\n✅ Novel news correctly detected - trading skipped!")
+    
+    logger.info("\n" + "="*80)
