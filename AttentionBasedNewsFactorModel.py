@@ -509,10 +509,9 @@ class AttentionBasedNewsFactorModel:
                             mlflow.log_metric(metric, value, step=epoch)
 
             # Train data preparation with augmented targets
-            keyword_sequences = training_data['keyword_sequence']
             
-            # Convert TF Tensors to NumPy
-            X_keywords = np.array([seq.numpy() for seq in keyword_sequences])
+            
+            X_keywords = np.array([seq.numpy() for seq in training_data['keyword_sequence']]) # Convert TF Tensors to NumPy
             
             # Shape will be (batch, 1, max_keywords) - squeeze the middle dimension
             if X_keywords.ndim == 3 and X_keywords.shape[1] == 1:
@@ -540,13 +539,9 @@ class AttentionBasedNewsFactorModel:
             # Validation data preparation
             validation_data_prepared = None
             if validation_data:
-                val_keyword_sequences = validation_data['keyword_sequence']
-                if isinstance(val_keyword_sequences[0], dict):
-                    val_X_keywords = np.array([seq['input_ids'][0] if len(seq['input_ids'].shape) > 1 else seq['input_ids'] for seq in val_keyword_sequences])
-                else:
-                    val_X_keywords = np.array(val_keyword_sequences)
-                    if val_X_keywords.ndim == 3 and val_X_keywords.shape[1] == 1:
-                        val_X_keywords = np.squeeze(val_X_keywords, axis=1)
+                val_X_keywords = np.array([seq.numpy() for seq in validation_data['keyword_sequence']])
+                if val_X_keywords.ndim == 3 and val_X_keywords.shape[1] == 1:
+                    val_X_keywords = np.squeeze(val_X_keywords, axis=1)
                 
                 val_X_baseline_correlation = np.array(validation_data['baseline_correlation'])
                 val_y_correlation_actual = np.array(validation_data['correlation_changes'])
@@ -667,7 +662,7 @@ class AttentionBasedNewsFactorModel:
             'mean': predictions[0][..., 0],
             'std': sigma,
             'total_confidence': total_confidence,
-            'reconstruction_confidence': recon_confidence,
+            'recon_confidence': recon_confidence,
             'uncertainty_confidence': uncertainty_confidence,
             'price_deviations': predictions[1],
             'reconstruction_error': recon_error  # Return for debugging

@@ -71,7 +71,7 @@ class AdvancedTradingSystem:
             'calibration_ratio': calibration_ratio,
             'improvement_over_baseline': improvement,
             'improvement_percentage': improvement_pct,
-            'avg_predicted_sigma': np.mean(sigma),
+            'avg_sigma_z': np.mean(sigma),
             'confidence_score': predictions['confidence']['total_confidence']
         }
     
@@ -236,28 +236,26 @@ class AdvancedTradingSystem:
 
         # Get news embedding for reconstruction error
         news_target_embedding = self.data_processor.get_bert_embedding(news_text)[:self.data_processor.news_factor_model.latent_dim]
+        # Use predict_with_uncertainty for probabilistic predictions
+        predictions = self.data_processor.news_factor_model.predict_with_uncertainty(
+            self.data_processor.prepare_keyword_sequence(news_text)['input_ids'],
+            np.expand_dims(self.data_processor.baseline_z, 0),
+            news_target_embedding  # Real reconstruction error
+            )
+        
+        # Extract probabilistic predictions
+        mu_z = predictions['mean'][0]  # [N, N] - μ in Fisher-z space
+        sigma_z = predictions['std'][0]    # [N, N] - σ (uncertainty)
+        total_confidence = predictions['total_confidence']
+
+        # Convert back to correlation space
+        predicted_corr = self.data_processor.inverse_fisher_z_transform(mu_z)
+        baseline_corr = self.data_processor.inverse_fisher_z_transform(self.data_processor.baseline_z)
+        delta_corr = predicted_corr - baseline_corr
+        sigma_corr = self.data_processor.fisher_z_sigma_to_correlation_sigma(mu_z, sigma_z)
         
         results = {}
-        for company in target_companies:            
-            # Use predict_with_uncertainty for probabilistic predictions
-            predictions = self.data_processor.news_factor_model.predict_with_uncertainty(
-                self.data_processor.prepare_keyword_sequence(news_text)['input_ids'],
-                np.expand_dims(self.data_processor.baseline_z, 0),
-                news_target_embedding  # CRITICAL: Real reconstruction error
-            )
-            
-            # Extract probabilistic predictions
-            predicted_corr_z = predictions['mean'][0]  # [N, N] - μ in Fisher-z space
-            predicted_sigma = predictions['std'][0]    # [N, N] - σ (uncertainty)
-            total_confidence = predictions['total_confidence']
-            price_deviations = predictions['price_deviations'][0]
-            reconstruction_error = predictions['reconstruction_error']
-            
-            # Convert back to correlation space
-            predicted_corr = self.data_processor.inverse_fisher_z_transform(predicted_corr_z)
-            baseline_corr = self.data_processor.inverse_fisher_z_transform(self.data_processor.baseline_z)
-            delta_corr = predicted_corr - baseline_corr
-            
+        for company in target_companies:
             # Analyze correlation changes for this company
             company_idx_in_list = self.data_processor.companies.index(company) if company in self.data_processor.companies else 0
             
@@ -266,7 +264,7 @@ class AdvancedTradingSystem:
             for i, other_company in enumerate(self.data_processor.companies):
                 if i != company_idx_in_list:
                     change = delta_corr[company_idx_in_list, i]
-                    uncertainty = predicted_sigma[company_idx_in_list, i]
+                    uncertainty = sigma_z[company_idx_in_list, i]
                     
                     # Only report if change is significant AND uncertainty is low
                     if abs(change) > correlation_threshold and uncertainty < self.uncertainty_threshold:
@@ -282,10 +280,7 @@ class AdvancedTradingSystem:
             # Calculate overall impact metrics
             max_change = float(np.max(np.abs(delta_corr[company_idx_in_list, :])))
             mean_change = float(np.mean(delta_corr[company_idx_in_list, :]))
-            avg_uncertainty = float(np.mean(predicted_sigma[company_idx_in_list, :]))
-            
-            # Price impact
-            price_impact = float(price_deviations[company_idx_in_list])
+            avg_uncertainty = float(np.mean(sigma_z[company_idx_in_list, :]))
             
             # Similar companies (based on predicted correlations)
             similar_companies = []
@@ -304,8 +299,14 @@ class AdvancedTradingSystem:
             )
             
             results[company] = {
+                'predicted_corr': predicted_corr,
+                'baseline_corr': baseline_corr,
+                'delta_corr': delta_corr,
+                'sigma_corr' : sigma_corr,
                 'total_confidence': total_confidence,
-                'reconstruction_error': float(reconstruction_error),
+                'recon_confidence': predictions['recon_confidence'],
+                'uncertainty_confidence': predictions['uncertainty_confidence'],
+                'reconstruction_error': float(predictions['reconstruction_error']),
                 'news_scope': news_scope,
                 'affected_companies': affected_companies,
                 'tradeable': tradeable,
@@ -317,13 +318,9 @@ class AdvancedTradingSystem:
                     'baseline_avg': float(np.mean(baseline_corr[company_idx_in_list, :])),
                     'predicted_avg': float(np.mean(predicted_corr[company_idx_in_list, :]))
                 },
-                'price_impact': price_impact,
+                'price_impact': float(predictions['price_deviations'][0][company_idx_in_list]),
                 'similar_companies': similar_companies[:5],
-                # Include matrices for advanced analysis
-                'delta_matrix': delta_corr,
-                'baseline_matrix': baseline_corr,
-                'predicted_matrix': predicted_corr,
-                'uncertainty_matrix': predicted_sigma
+                'uncertainty_matrix': sigma_z
             }
         
         return results
