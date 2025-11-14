@@ -67,7 +67,7 @@ if __name__ == "__main__":
         validation_data=validation_data,
         epochs=50,
         batch_size=8
-    )
+        )
 
     # --- TRADING SYSTEM SETUP ---
     trading_system = AdvancedTradingSystem(data_processor)
@@ -96,16 +96,20 @@ if __name__ == "__main__":
     
     if ari > 0.3 and silhouette > 0.2:
         logger.info(
-            f"\n✅ Model successfully learned to distinguish news types implicitly!\n"
-            f"   Adjusted Rand Index: {ari:.3f}\n"
-            f"   Silhouette Score: {silhouette:.3f}"
+            "\n✅ Model successfully learned to distinguish news types implicitly!\n"
+            "   Adjusted Rand Index: %.3f\n"
+            "   Silhouette Score: %.3f",
+            ari,
+            silhouette,
         )
     else:
         logger.warning(
-            f"\n⚠️  Model struggles to capture news type distinctions\n"
-            f"   Adjusted Rand Index: {ari:.3f}\n"
-            f"   Silhouette Score: {silhouette:.3f}\n"
-            f"   Consider: more training data or stronger regularization"
+            "\n⚠️  Model struggles to capture news type distinctions\n"
+            "   Adjusted Rand Index: %.3f\n"
+            "   Silhouette Score: %.3f\n"
+            "   Consider: more training data or stronger regularization",
+            ari,
+            silhouette,
         )
 
     # ============================================================================

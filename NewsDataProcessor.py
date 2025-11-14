@@ -92,19 +92,15 @@ class NewsDataProcessor:
                 # Tokenize
                 keyword_input = self.prepare_keyword_sequence(news_text)['input_ids']
                 
-                # Get BERT embedding for reconstruction
-                news_target_embedding = self.get_bert_embedding(news_text)
-                news_target_embedding = news_target_embedding[:self.news_factor_model.latent_dim]
+                # Get news embedding for reconstruction error
+                news_target_embedding = self.get_bert_embedding(news_text)[:self.news_factor_model.latent_dim]
                 
                 # Compute post-news correlation
                 post_news_corr = self._compute_post_news_correlation_matrix(news_timestamp, affected_companies)
                 post_news_z = self.fisher_z_transform(post_news_corr)
                 
                 # Compute price deviations
-                price_dev = self._compute_price_deviations_from_expected(
-                    news_timestamp, 
-                    affected_companies
-                )
+                price_dev = self._compute_price_deviations_from_expected(news_timestamp, affected_companies)
                 
                 # Create affected companies mask
                 affected_mask = self._create_affected_mask(affected_companies, self.companies)
@@ -186,13 +182,11 @@ class NewsDataProcessor:
                 min_len = min(len(returns1), len(returns2))
                 if min_len < 5:
                     continue
-                
                 try:
                     corr_val = np.corrcoef(
                         returns1[-min_len:], 
                         returns2[-min_len:]
                     )[0, 1]
-                    
                     if not np.isnan(corr_val):
                         self.baseline_correlation_matrix[i, j] = corr_val
                         self.baseline_correlation_matrix[j, i] = corr_val

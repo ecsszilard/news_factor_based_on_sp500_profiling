@@ -603,13 +603,15 @@ class PerformanceAnalyzer:
         
         # 4. Confidence Breakdown
         ax4 = axes[1, 1]
-        components = ['Total\nConfidence', 'Reconstruction\n(Epistemic)', 'Uncertainty\n(Aleatoric)']
+        components = ['Total\nConfidence', 'Reconstruction\n(Epistemic)', 'Uncertainty\n(Total)', 'Epistemic\n(MC Dropout)', 'Aleatoric\n(Data)']
         values = [
             analysis['total_confidence'],
             analysis['recon_confidence'],
-            analysis['uncertainty_confidence']
+            analysis['uncertainty_confidence'],
+            analysis.get('epistemic_confidence', 0.5),  # New: MC Dropout
+            1.0 / (1.0 + analysis.get('aleatoric_uncertainty', 0.3))  # New: Data noise
         ]
-        colors = ['green', 'blue', 'orange']
+        colors = ['green', 'blue', 'orange', 'purple', 'red']
         bars = ax4.bar(components, values, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
         ax4.set_ylabel('Confidence Score', fontsize=12, fontweight='bold')
         ax4.set_title('Confidence Score Breakdown', fontsize=12, fontweight='bold')
@@ -625,11 +627,15 @@ class PerformanceAnalyzer:
         
         # Statistics
         uncertainty_matrix = analysis.get('uncertainty_matrix', sigma_corr)
-        stats_text = f"Avg σ: {np.mean(uncertainty_matrix):.4f}\n"
+        epistemic_unc = analysis.get('epistemic_uncertainty', 0)
+        aleatoric_unc = analysis.get('aleatoric_uncertainty', 0)
+        
+        stats_text = f"Avg σ_total: {np.mean(uncertainty_matrix):.4f}\n"
+        stats_text += f"σ_epistemic: {epistemic_unc:.4f}\n"
+        stats_text += f"σ_aleatoric: {aleatoric_unc:.4f}\n"
         stats_text += f"Max σ: {np.max(uncertainty_matrix):.4f}\n"
         stats_text += f"High uncertainty pairs: {np.sum(uncertainty_matrix > 0.3)}/{len(companies)**2}"
-        ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=10, 
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
         return fig

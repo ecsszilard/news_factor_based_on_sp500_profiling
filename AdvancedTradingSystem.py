@@ -240,8 +240,9 @@ class AdvancedTradingSystem:
         predictions = self.data_processor.news_factor_model.predict_with_uncertainty(
             self.data_processor.prepare_keyword_sequence(news_text)['input_ids'],
             np.expand_dims(self.data_processor.baseline_z, 0),
-            news_target_embedding  # Real reconstruction error
-            )
+            news_target_embedding,
+            n_samples=10  # MC Dropout samples
+        )
         
         # Extract probabilistic predictions
         mu_z = predictions['mean'][0]  # [N, N] - μ in Fisher-z space

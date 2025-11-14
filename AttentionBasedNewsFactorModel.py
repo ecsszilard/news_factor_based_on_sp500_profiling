@@ -608,62 +608,86 @@ class AttentionBasedNewsFactorModel:
                 mlflow.log_metric('best_train_loss', min(history.history['loss']))     
         return history
 
-    def predict_with_uncertainty(self, keywords, baseline_correlation, news_target_embedding):
+    def predict_with_uncertainty(self, keywords, baseline_correlation, news_target_embedding, n_samples: int = 10):
         """
-        Make predictions with uncertainty estimates
-        
+        Monte Carlo Dropout uncertainty + reconstruction-based confidence.
+
         Args:
             keywords: Tokenized keywords
             baseline_correlation: Baseline correlation matrix
             news_target_embedding: Ground truth BERT embedding of the news (for reconstruction error)
-        
+            n_samples: Number of MC Dropout samples (default: 10)
+
         Returns:
-            mu: Predicted correlation change means
-            sigma: Predicted correlation change uncertainties
-            confidence: Overall prediction confidence (epistemic + aleatoric)
+            Dict with mean, std (total), epistemic_std, aleatoric_std, and confidence scores
         """
 
-        # Ensure proper shape [batch, max_keywords]
+        # ----------------------------
+        # 1) Ensure correct shapes
+        # ----------------------------
+        # keywords: [batch, max_keywords]
         if keywords.ndim == 3 and keywords.shape[1] == 1:
             keywords = np.squeeze(keywords, axis=1)
         elif keywords.ndim == 1:
-            keywords = np.expand_dims(keywords, axis=0)
-        
-        predictions = self.model.predict([
-            keywords, 
-            baseline_correlation
-        ], verbose=0)
-        
-        # Calculate REAL reconstruction error
-        recon_prediction = predictions[2]  # [batch, latent_dim]
-        
-        # Ensure shapes match
+            keywords = keywords[None, :]
+
+        # baseline: must be [batch, N, N]
+        if baseline_correlation.ndim == 2:
+            baseline_correlation = baseline_correlation[None, ...]
+
+        # news target embedding: [1, latent_dim]
         if news_target_embedding.ndim == 1:
             news_target_embedding = news_target_embedding.reshape(1, -1)
-        
-        # Trim to same length if needed
+
+        # ----------------------------
+        # 2) Monte Carlo Dropout: multiple forward passes with dropout enabled
+        # ----------------------------
+        mc_mu, mc_logvar = [], []
+
+        for _ in range(n_samples):
+            pred = self.model([keywords, baseline_correlation], training=True)
+            mu_sample = pred[0][..., 0].numpy()
+            logvar_sample = pred[0][..., 1].numpy()
+
+            mc_mu.append(mu_sample)
+            mc_logvar.append(logvar_sample)
+
+        mc_mu = np.array(mc_mu)
+        mc_logvar = np.array(mc_logvar)
+
+        # ----------------------------
+        # 3) Uncertainty decomposition
+        # ----------------------------
+        epistemic_var = np.var(mc_mu, axis=0) # Epistemic uncertainty: variance across MC samples
+        aleatoric_var = np.mean(np.exp(mc_logvar) + 1e-6, axis=0) # Aleatoric uncertainty: average of predicted variances
+
+        sigma_epistemic = np.sqrt(epistemic_var)
+        sigma_aleatoric = np.sqrt(aleatoric_var)
+        sigma_total = np.sqrt(epistemic_var + aleatoric_var)
+
+        # ----------------------------
+        # 4) Reconstruction error
+        # ----------------------------
+        final_pred = self.model.predict([keywords, baseline_correlation], verbose=0)
+        recon_prediction = final_pred[2]  # shape [1, latent_dim]
+
         min_len = min(recon_prediction.shape[-1], news_target_embedding.shape[-1])
-        recon_prediction_trimmed = recon_prediction[..., :min_len]
-        news_target_trimmed = news_target_embedding[..., :min_len]
-        
-        # Calculate ACTUAL reconstruction error (epistemic uncertainty)
-        recon_error = np.mean(np.abs(recon_prediction_trimmed - news_target_trimmed))
-        sigma = np.sqrt(np.exp(predictions[0][..., 1]) + 1e-6)
-        
-        # Reconstruction quality component (epistemic uncertainty)
-        recon_confidence = np.exp(-recon_error)
-        # Predicted uncertainty component (aleatoric uncertainty)
-        uncertainty_confidence = 1.0 / (1.0 + np.mean(sigma))
-        
-        # Combined score
-        total_confidence = recon_confidence * uncertainty_confidence
-        
+        recon_error = np.mean(np.abs(news_target_embedding[..., :min_len] - recon_prediction[..., :min_len]))
+
+        # ----------------------------
+        # 5) Confidence scores
+        # ----------------------------
+        recon_conf = np.exp(-recon_error)
+        unc_conf = 1.0 / (1.0 + sigma_total.mean())
+
         return {
-            'mean': predictions[0][..., 0],
-            'std': sigma,
-            'total_confidence': total_confidence,
-            'recon_confidence': recon_confidence,
-            'uncertainty_confidence': uncertainty_confidence,
-            'price_deviations': predictions[1],
-            'reconstruction_error': recon_error  # Return for debugging
+            "mean": np.mean(mc_mu, axis=0),
+            "std": sigma_total,
+            "epistemic_std": sigma_epistemic,
+            "aleatoric_std": sigma_aleatoric,
+            "total_confidence": recon_conf * unc_conf,
+            "recon_confidence": recon_conf,
+            "uncertainty_confidence": unc_conf,
+            "price_deviations": final_pred[1],
+            "reconstruction_error": recon_error,
         }
