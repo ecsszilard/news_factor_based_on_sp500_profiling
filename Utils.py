@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import time
 import datetime
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
@@ -11,14 +10,14 @@ class NewsType(Enum):
     RUMOR = "rumor"  # Pletyka - előre jelzi a jövőbeli hírt
     EXPECTED = "expected"  # Várt hír - már beárazott
     SURPRISE = "surprise"  # Meglepetés - váratlan esemény
-    CONFIRMING = "confirming"  # Megerősítő - korábbi pletykát validál
+    CONFIRMING = "confirming"  # Megerősítő - korábbi pletykákat validál
     CONTEXT_DEPENDENT = "context"  # Kontextus-függő - más hírrel együtt értékes
 
 class NewsScope(Enum):
     """Hír hatáskörének mértéke"""
     COMPANY_SPECIFIC = "company"  # Cégspecifikus (1-2 cég)
     SECTOR = "sector"  # Szektorális (azonos szektorú cégek)
-    MARKET_WIDE = "market"  # Piacszintű (FED, makro hírek)
+    MARKET_WIDE = "market"  # Piaci szintű (FED, makro hírek)
 
 @dataclass
 class NewsEvent:
@@ -55,8 +54,8 @@ class Utils:
     
     def create_hybrid_data(self, 
                           num_companies: int = 20,
-                          num_news: int = 150,
-                          days: int = 90,
+                          num_news: int = 200,
+                          days: int = 100,
                           train_ratio: float = 0.7):
         """
         Hibrid adatgenerálás: realisztikus ár- és hírgenerálás fejlett szimulációval
@@ -148,15 +147,15 @@ class Utils:
     
     def _build_correlation_matrix(self, companies: List[str], sector_map: Dict) -> np.ndarray:
         """
-        Korrelációs mátrix C építése:
+        Korrelációs mátrix C építése szimmetrikus és PSD módon:
         - Azonos szektor: 0.5-0.8
-        - Különböző szektor: 0.1-0.3
-        - Speciális párok: magasabb korreláció
+        - Különböző szektor: -0.2 és 0.3 között (negatív korreláció is lehetséges)
+        - Speciális párok: magasabb/negatív korreláció
         """
         n = len(companies)
         corr_matrix = np.eye(n)
         
-        # Speciális párok (erősebb kapcsolat)
+        # Speciális párok (erősebb kapcsolat vagy negatív)
         special_pairs = {
             ('AAPL', 'MSFT'): 0.75,
             ('F', 'GM'): 0.85,
@@ -164,6 +163,11 @@ class Utils:
             ('XOM', 'CVX'): 0.82,
             ('PFE', 'JNJ'): 0.70,
             ('TSLA', 'NVDA'): 0.65,
+            # Negatív korrelációk (pl. olaj vs. légitársaságok proxy-ja)
+            ('XOM', 'TSLA'): -0.3,  # Olaj vs. elektromos autó
+            ('CVX', 'TSLA'): -0.25,
+            ('XOM', 'AMZN'): -0.15,  # Olajár emelkedés vs. szállítási költség
+            ('CVX', 'AMZN'): -0.15,
         }
         
         for i, c1 in enumerate(companies):
@@ -173,27 +177,52 @@ class Utils:
                 
                 # Ellenőrizzük speciális párokat
                 pair_key = tuple(sorted([c1, c2]))
-                if pair_key in special_pairs or (c2, c1) in special_pairs:
-                    corr = special_pairs.get(pair_key, special_pairs.get((c2, c1)))
+                reverse_pair = (c2, c1)
+                
+                if pair_key in special_pairs:
+                    corr = special_pairs[pair_key]
+                elif reverse_pair in special_pairs:
+                    corr = special_pairs[reverse_pair]
                 else:
                     # Szektor alapú korreláció
                     s1, s2 = sector_map.get(c1, 'Unknown'), sector_map.get(c2, 'Unknown')
                     if s1 == s2:
                         corr = np.random.uniform(0.5, 0.8)
                     else:
-                        corr = np.random.uniform(0.1, 0.3)
+                        # Különböző szektorok: negatív korreláció is lehetséges
+                        corr = np.random.uniform(-0.2, 0.3)
                 
                 corr_matrix[i, j] = corr
                 corr_matrix[j, i] = corr
+        
+        # PSD biztosítása: eigenvalue decomposition + clipping
+        eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
+        eigenvalues = np.maximum(eigenvalues, 1e-6)  # Negatív eigenvalue-k kikorrektálása
+        corr_matrix = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+        
+        # Diagonális elemek = 1 biztosítása
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(corr_matrix)))
+        corr_matrix = D_inv_sqrt @ corr_matrix @ D_inv_sqrt
+        
+        # Szimmetria biztosítása
+        corr_matrix = (corr_matrix + corr_matrix.T) / 2
         
         return corr_matrix
     
     def _build_covariance_matrix(self, volatilities: np.ndarray, correlation_matrix: np.ndarray) -> np.ndarray:
         """
-        Kovarianciamátrix Σ építése:
+        Kovarianciamátrix Σ építése szimmetrikus módon:
         Σ_ij = σ_i * σ_j * C_ij
         """
-        return np.outer(volatilities, volatilities) * correlation_matrix
+        # D = diag(σ_1, ..., σ_n)
+        D = np.diag(volatilities)
+        # Σ = D * C * D
+        covariance_matrix = D @ correlation_matrix @ D
+        
+        # Szimmetria biztosítása numerikus hibák miatt
+        covariance_matrix = (covariance_matrix + covariance_matrix.T) / 2
+        
+        return covariance_matrix
     
     def _generate_news_with_relationships(self,
                                          num_news: int,
@@ -224,23 +253,33 @@ class Utils:
                 ("Sources suggest {company} may be planning major restructuring", 0.01, 0.3, 0.5, 0.1),
                 ("Unconfirmed reports of {company} acquisition talks", 0.015, 0.4, 0.5, 0.15),
                 ("Industry insiders hint at {company} product delays", -0.01, 0.3, 0.5, 0.1),
+                ("Whispers of {company} facing supply chain crisis", -0.012, 0.35, 0.5, 0.12),
+                ("Speculation about {company} executive departures", -0.008, 0.4, 0.5, 0.1),
             ],
             NewsType.EXPECTED: [
                 ("{company} announces expected quarterly earnings in line with forecasts", 0.005, 0.9, 0.3, 0.05),
                 ("{company} confirms previously announced dividend payment", 0.002, 0.95, 0.2, 0.03),
+                ("{company} reports anticipated product launch on schedule", 0.004, 0.85, 0.3, 0.04),
             ],
             NewsType.SURPRISE: [
                 ("{company} reports unexpected 30% earnings beat", 0.04, 0.0, 0.4, 0.2),
                 ("{company} CEO unexpectedly resigns effective immediately", -0.03, 0.0, 0.4, 0.15),
                 ("{company} faces surprise regulatory investigation", -0.035, 0.05, 0.5, 0.2),
+                ("{company} issues profit warning, slashes guidance", -0.045, 0.0, 0.5, 0.25),
+                ("{company} hit with massive regulatory fine for compliance violations", -0.04, 0.0, 0.6, 0.22),
+                ("{company} announces unexpected major product recall", -0.038, 0.05, 0.55, 0.2),
+                ("{company} faces class-action lawsuit over safety concerns", -0.032, 0.1, 0.5, 0.18),
+                ("{company} reports cybersecurity breach affecting customer data", -0.028, 0.0, 0.45, 0.16),
             ],
             NewsType.CONFIRMING: [
                 ("{company} officially confirms earlier merger speculation", 0.008, 0.7, 0.3, 0.1),
                 ("{company} validates rumored partnership with tech giant", 0.012, 0.6, 0.3, 0.12),
+                ("{company} confirms anticipated executive shake-up", -0.006, 0.75, 0.3, 0.08),
             ],
             NewsType.CONTEXT_DEPENDENT: [
                 ("{company} reports supply chain improvements", 0.015, 0.3, 0.6, 0.15),
                 ("{company} announces cost reduction initiative", 0.01, 0.4, 0.5, 0.1),
+                ("{company} reveals restructuring program details", -0.008, 0.35, 0.5, 0.12),
             ]
         }
         
@@ -249,18 +288,25 @@ class Utils:
             ("Automotive industry supply chain shows recovery signs", ['Consumer Discretionary'], 0.025, 0.3, 0.4, 0.25),
             ("Energy sector benefits from rising commodity prices", ['Energy'], 0.03, 0.2, 0.3, 0.35),
             ("Financial sector impacted by interest rate changes", ['Financials'], 0.015, 0.4, 0.5, 0.3),
+            ("Technology sector hit by antitrust investigations", ['Technology'], -0.025, 0.15, 0.45, 0.32),
+            ("Healthcare sector faces drug pricing legislation", ['Healthcare'], -0.022, 0.25, 0.5, 0.28),
+            ("Energy sector pressured by renewable energy mandates", ['Energy'], -0.018, 0.3, 0.4, 0.25),
+            ("Consumer discretionary weakens on recession fears", ['Consumer Discretionary'], -0.02, 0.2, 0.45, 0.27),
         ]
         
         market_templates = [
-            ("Federal Reserve raises interest rates by 0.75% to combat inflation", 0.02, 0.3, 0.5, 0.5),
+            ("Federal Reserve raises interest rates by 0.75% to combat inflation", -0.02, 0.3, 0.5, 0.5),
             ("Fed announces quantitative tightening, reducing liquidity", -0.025, 0.2, 0.6, 0.6),
             ("Global economic growth forecast revised downward amid recession fears", -0.03, 0.1, 0.5, 0.55),
             ("Central banks worldwide coordinate monetary policy to stabilize markets", 0.015, 0.4, 0.4, 0.45),
-            ("Trade tensions escalate between major economies", -0.02, 0.2, 0.5, 0.5),
+            ("Trade tensions escalate between major economies", -0.022, 0.2, 0.5, 0.52),
             ("Unexpected geopolitical crisis triggers market volatility", -0.035, 0.0, 0.6, 0.65),
+            ("Credit market freeze sparks liquidity concerns", -0.04, 0.05, 0.65, 0.7),
+            ("Major bank failure raises systemic risk fears", -0.045, 0.0, 0.7, 0.75),
+            ("Inflation data comes in much hotter than expected", -0.028, 0.1, 0.55, 0.58),
         ]
         
-        # 1. Hírláncolatok (pletyka → confirming)
+        # 1. Hírláncok (pletyka → confirming)
         num_chains = int(num_news * 0.15)
         
         for _ in range(num_chains):
@@ -362,7 +408,7 @@ class Utils:
             news_events.append(sector_news)
             self.news_counter += 1
         
-        # 3. Piacszintű hírek (FED, makro) - h = (1,1,...,1)^T
+        # 3. Piaci szintű hírek (FED, makro) - h = (1,1,...,1)^T
         num_market = int(num_news * 0.15)
         for _ in range(num_market):
             template = market_templates[int(np.random.randint(len(market_templates)))]
@@ -566,7 +612,6 @@ class Utils:
                 prices[day_date.timestamp()] = price
             
             price_data[company] = prices
-        
         return price_data
     
     def _convert_event_to_dict(self, news: NewsEvent, companies: List[str]) -> Dict:

@@ -2,19 +2,18 @@ import numpy as np
 import logging
 from scipy.stats import pearsonr
 import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List
 
 logger = logging.getLogger("AdvancedNewsFactor.NewsDataProcessor")
 
 class NewsDataProcessor:
     """Processing news data for probabilistic residual learning correlation model"""
     
-    def __init__(self, news_factor_model, sample_prices, bert_model):
+    def __init__(self, news_factor_model, sample_prices):
         """Initialize the news data processor"""
         self.news_factor_model = news_factor_model
         self.sample_prices = sample_prices
         self.companies = list(sample_prices.keys())
-        self.bert_model = bert_model
         
         # Baseline correlation matrices (IMMUTABLE after first computation)
         self.baseline_correlation_matrix = None
@@ -24,9 +23,6 @@ class NewsDataProcessor:
         
         # Dictionary format for backward compatibility
         self.correlation_dict_matrix = {}
-        
-        # Simple BERT embedding cache (hash-based)
-        self._bert_cache = {}
         
         logger.info("NewsDataProcessor initialized (Probabilistic Mode)")
     
@@ -89,11 +85,9 @@ class NewsDataProcessor:
                 affected_companies = news_item.get('companies', [])
                 news_timestamp = news_item['timestamp']
                 
-                # Tokenize
-                keyword_input = self.prepare_keyword_sequence(news_text)['input_ids']
-                
-                # Get news embedding for reconstruction error
-                news_target_embedding = self.get_bert_embedding(news_text)[:self.news_factor_model.latent_dim]
+                # Get keeywords and news embedding for reconstruction
+                keywords = self.news_factor_model.prepare_keyword_sequence(news_text)
+                news_target_embedding = self.news_factor_model.get_bert_embedding(news_text)
                 
                 # Compute post-news correlation
                 post_news_corr = self._compute_post_news_correlation_matrix(news_timestamp, affected_companies)
@@ -106,7 +100,7 @@ class NewsDataProcessor:
                 affected_mask = self._create_affected_mask(affected_companies, self.companies)
                 
                 # Store training sample
-                training_samples['keyword_sequence'].append(keyword_input)
+                training_samples['keyword_sequence'].append(keywords)
                 training_samples['baseline_correlation'].append(self.baseline_z)
                 training_samples['correlation_changes'].append(post_news_z)
                 training_samples['price_deviations'].append(price_dev)
@@ -114,7 +108,7 @@ class NewsDataProcessor:
                 training_samples['affected_companies_mask'].append(affected_mask)
                 
             except Exception as e:
-                logger.error(f"Error processing news item: {e}")
+                logger.error("Error processing news item: %s", e)
                 continue
         
         logger.info(
@@ -129,7 +123,6 @@ class NewsDataProcessor:
                 self.baseline_z.min(),
                 self.baseline_z.max()
             )
-        
         return training_samples
     
     def compute_baseline_correlation_pre_training(self, 
@@ -267,21 +260,6 @@ class NewsDataProcessor:
         derivative = 1 - tanh_mu**2  # sech²(z)
         sigma_corr = sigma_z * derivative
         return np.clip(sigma_corr, 0, 1)
-
-    def prepare_keyword_sequence(self, text: str) -> Dict:
-        """
-        Tokenize text using the model's tokenizer
-        
-        Returns:
-            BatchEncoding dict with 'input_ids' as TF Tensor of shape (1, max_keywords)
-        """
-        return self.news_factor_model.tokenizer(
-            text, 
-            return_tensors='tf', 
-            max_length=self.news_factor_model.max_keywords, 
-            truncation=True, 
-            padding='max_length'
-        )
     
     def _compute_post_news_correlation_matrix(self, 
                                              news_timestamp: float,
@@ -399,32 +377,7 @@ class NewsDataProcessor:
                 expected_return /= weight_sum
             
             deviations[i] = actual_returns[company] - expected_return
-        
         return deviations
-    
-    def get_bert_embedding(self, text: str) -> np.ndarray:
-        """
-        Get BERT embedding with simple hash-based caching
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Embedding vector [768]
-        """
-        # Simple cache check
-        text_key = hash(text.strip().lower())
-        if text_key in self._bert_cache:
-            return self._bert_cache[text_key].copy()
-        
-        inputs = self.prepare_keyword_sequence(text)
-        outputs = self.bert_model(**inputs)
-        embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]
-                
-        # Cache the result - prevent recomputation
-        self._bert_cache[text_key] = embedding.copy()
-        
-        return embedding
     
     def _create_affected_mask(self, 
                              affected_companies_list: List[str],

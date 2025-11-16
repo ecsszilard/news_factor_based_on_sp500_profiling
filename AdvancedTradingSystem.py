@@ -1,21 +1,19 @@
 import numpy as np
-import tensorflow as tf
 import datetime
 import pickle
 import os
 import logging
 
 logger = logging.getLogger("AdvancedNewsFactor.AdvancedTradingSystem")
-models = tf.keras.models
 
 class AdvancedTradingSystem:
     """Trading system using probabilistic correlation-based news factor model with Residual Learning"""
 
     def __init__(self, data_processor):
         self.data_processor = data_processor
-        self.word_to_idx = data_processor.news_factor_model.tokenizer.vocab
-        self.keyword_embedding_layer = self.data_processor.news_factor_model.model.get_layer("keyword_embeddings")
-        self.company_embedding_layer = self.data_processor.news_factor_model.model.get_layer("company_embeddings")
+        self.news_factor_model = self.data_processor.news_factor_model
+        self.word_to_idx = self.news_factor_model.tokenizer.get_vocab()
+        self.idx_to_word = {idx: tok for tok, idx in self.word_to_idx.items()}
         
         # Trading data
         self.positions = {}
@@ -75,59 +73,6 @@ class AdvancedTradingSystem:
             'confidence_score': predictions['confidence']['total_confidence']
         }
     
-    def get_similar_companies_by_news_response(self, target_company, top_k=5):
-        return self._get_similar_items(
-            target_key=target_company,
-            idx_lookup={symbol: i for i, symbol in enumerate(self.data_processor.companies)},
-            name_lookup={i: symbol for i, symbol in enumerate(self.data_processor.companies)},
-            embedding_layer=self.company_embedding_layer,
-            top_k=top_k
-        )
-
-    def get_similar_keywords_by_impact(self, target_word, top_k=10):
-        return self._get_similar_items(
-            target_key=target_word,
-            idx_lookup=self.word_to_idx,  
-            name_lookup={v: k for k, v in self.word_to_idx.items()},
-            embedding_layer=self.keyword_embedding_layer,
-            top_k=top_k,
-            invalid_tokens={'[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]'} 
-        )
-    
-    def _get_similar_items(self, target_key, idx_lookup, name_lookup, embedding_layer, top_k=5, invalid_tokens=None):
-        """Generic function to find similar items based on embedding cosine similarity."""
-        if target_key not in idx_lookup:
-            return []
-        
-        target_idx = idx_lookup[target_key]
-        all_embeddings = embedding_layer.get_weights()[0]
-
-        if target_idx >= len(all_embeddings):
-            return []
-
-        target_embedding = all_embeddings[target_idx]
-        similarities = []
-        target_norm = np.linalg.norm(target_embedding)
-
-        if target_norm <= 1e-8:
-            return []
-
-        for idx, item in name_lookup.items():
-            if idx == target_idx or idx >= len(all_embeddings):
-                continue
-            if invalid_tokens and item in invalid_tokens:
-                continue
-
-            embedding = all_embeddings[idx]
-            embedding_norm = np.linalg.norm(embedding)
-
-            if embedding_norm > 1e-8:
-                similarity = np.dot(target_embedding, embedding) / (target_norm * embedding_norm)
-                similarities.append((item, similarity))
-
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
-    
     def _classify_news_scope(self, news_text, mentioned_companies):
         """
         Detect if news is global/macro or company-specific
@@ -159,19 +104,19 @@ class AdvancedTradingSystem:
         
         # Check for global keywords
         if any(keyword in news_lower for keyword in global_keywords):
-            logger.info(f"Detected GLOBAL news: {news_text[:80]}...")
-            return 'global'
-        
+            logger.info("Detected GLOBAL news: %s...", news_text[:80])
+            return "global"
+
         # Check for sector keywords
         for sector, keywords in sector_keywords.items():
             if any(keyword in news_lower for keyword in keywords):
-                logger.info(f"Detected SECTOR news ({sector}): {news_text[:80]}...")
-                return 'sector'
-        
+                logger.info("Detected SECTOR news (%s): %s...", sector, news_text[:80])
+                return "sector"
+
         # Company-specific if companies mentioned
         if mentioned_companies and len(mentioned_companies) <= 3:
-            logger.info(f"Detected COMPANY-SPECIFIC news: {mentioned_companies}")
-            return 'company'
+            logger.info("Detected COMPANY-SPECIFIC news: %s", mentioned_companies)
+            return "company"
         
         # Default to company-specific
         return 'company'
@@ -234,13 +179,10 @@ class AdvancedTradingSystem:
         # Detect news scope
         news_scope = self._classify_news_scope(news_text, affected_companies)
 
-        # Get news embedding for reconstruction error
-        news_target_embedding = self.data_processor.get_bert_embedding(news_text)[:self.data_processor.news_factor_model.latent_dim]
-        # Use predict_with_uncertainty for probabilistic predictions
-        predictions = self.data_processor.news_factor_model.predict_with_uncertainty(
-            self.data_processor.prepare_keyword_sequence(news_text)['input_ids'],
-            np.expand_dims(self.data_processor.baseline_z, 0),
-            news_target_embedding,
+        # Make probabilistic predictions
+        predictions = self.news_factor_model.predict_with_uncertainty(
+            text=news_text,  # Shape: (1, seq_len),
+            baseline_correlation = self.data_processor.baseline_z,
             n_samples=10  # MC Dropout samples
         )
         
@@ -323,7 +265,6 @@ class AdvancedTradingSystem:
                 'similar_companies': similar_companies[:5],
                 'uncertainty_matrix': sigma_z
             }
-        
         return results
     
     def generate_trading_signals(self, news_analysis, min_confidence=0.6, max_uncertainty=0.4):
@@ -347,20 +288,19 @@ class AdvancedTradingSystem:
             correlation_impact = analysis.get('correlation_impact', {})
             avg_uncertainty = correlation_impact.get('avg_uncertainty', 1.0)
             
-            # NEW: Check if tradeable based on uncertainty
-            if not analysis.get('tradeable', False):
-                logger.info(f"Skipping {company}: Low confidence or high uncertainty")
+            # Check if tradeable based on uncertainty
+            if not analysis.get("tradeable", False):
+                logger.info("Skipping %s: Low confidence or high uncertainty", company)
                 continue
-            
-            # Filter by confidence and uncertainty
+
             if total_confidence < min_confidence:
-                logger.info(f"Skipping {company}: Confidence {total_confidence:.3f} < {min_confidence}")
+                logger.info("Skipping %s: Confidence %.3f < %.3f", company, total_confidence, min_confidence)
                 continue
-            
+
             if avg_uncertainty > max_uncertainty:
-                logger.info(f"Skipping {company}: Uncertainty {avg_uncertainty:.3f} > {max_uncertainty}")
+                logger.info("Skipping %s: Uncertainty %.3f > %.3f", company, avg_uncertainty, max_uncertainty)
                 continue
-            
+
             # Determine signal type based on correlation changes
             max_correlation_change = correlation_impact.get('max_change', 0)
             mean_correlation_change = correlation_impact.get('mean_change', 0)
@@ -420,7 +360,6 @@ class AdvancedTradingSystem:
             key=lambda x: (x['strength'] * x['confidence']) / (x['uncertainty'] + 0.1), 
             reverse=True
         )
-        
         return signals
     
     def execute_trading_signals(self, signals, max_trades_per_day=10):
@@ -460,10 +399,10 @@ class AdvancedTradingSystem:
             self.trade_history.append(trade)
             
             logger.info(
-                f"Trade executed: {signal['type']} {signal['company']} "
-                f"${signal['position_size']:.2f} "
-                f"(conf: {signal['confidence']:.3f}, σ: {signal['uncertainty']:.3f}, "
-                f"Δcorr: {signal.get('correlation_impact', {}).get('max_change', 0):.3f})"
+                "Trade executed: %s %s $%.2f (conf: %.3f, σ: %.3f, Δcorr: %.3f)",
+                signal["type"], signal["company"], signal["position_size"],
+                signal["confidence"], signal["uncertainty"],
+                signal.get("correlation_impact", {}).get("max_change", 0.0),
             )
         
         return executed_trades
@@ -473,7 +412,7 @@ class AdvancedTradingSystem:
         if not os.path.exists(path):
             os.makedirs(path)
         
-        self.data_processor.news_factor_model.model.save_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
+        self.news_factor_model.model.save_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
         
         # Save trading data including correlation matrix
         with open(os.path.join(path, 'trading_data.pkl'), 'wb') as f:
@@ -490,11 +429,11 @@ class AdvancedTradingSystem:
     def load_model_and_data(self, path='probabilistic_correlation_models'):
         """Load the probabilistic correlation model and associated data"""
 
-        if not self.data_processor.news_factor_model.model:
-            self.data_processor.news_factor_model.build_model()
+        if not self.news_factor_model.model:
+            self.news_factor_model.build_model()
 
         try:
-            self.data_processor.news_factor_model.model.load_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
+            self.news_factor_model.model.load_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
 
             with open(os.path.join(path, 'trading_data.pkl'), 'rb') as f:
                 trading_data = pickle.load(f)
@@ -504,11 +443,11 @@ class AdvancedTradingSystem:
                 self.confidence_threshold = trading_data.get('confidence_threshold', 0.6)
                 self.uncertainty_threshold = trading_data.get('uncertainty_threshold', 0.4)
             
-            logger.info(f"Probabilistic models and data loaded: {path}")
+            logger.info("Probabilistic models and data loaded: %s", path)
             return True
             
         except Exception as e:
-            logger.error(f"Error during loading: {str(e)}")
+            logger.error("Error during loading: %s", e)
             return False
     
     def get_portfolio_diversification_metrics(self):
@@ -536,35 +475,3 @@ class AdvancedTradingSystem:
             'num_positions': len(significant_companies),
             'correlation_pairs': len(correlation_pairs)
         }
-
-    def analyze_keyword_impact_clusters(self, sample_keywords, similarity_threshold=0.7, return_matrix=False):
-        """Analyze how keywords cluster based on their learned impact patterns"""
-        if not sample_keywords:
-            return {}
-        
-        all_embeddings = self.keyword_embedding_layer.get_weights()[0]
-        valid_keywords = []
-        embeddings = []
-        
-        for word in sample_keywords:
-            idx = self.word_to_idx.get(word)
-            if idx is not None and idx < len(all_embeddings):
-                valid_keywords.append(word)
-                embeddings.append(all_embeddings[idx])
-
-        if len(valid_keywords) < 2:
-            return {}
-        
-        embeddings = np.array(embeddings)
-        normalized_embeddings = embeddings / np.maximum(np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-8) 
-        similarity_matrix = np.dot(normalized_embeddings, normalized_embeddings.T)
-        
-        # Find clusters of similar-impact keywords
-        clusters = {}
-        for i, w1 in enumerate(valid_keywords):
-            sims = [(w2, similarity_matrix[i, j]) for j, w2 in enumerate(valid_keywords) 
-                   if i != j and similarity_matrix[i, j] > similarity_threshold]
-            if sims:
-                clusters[w1] = sorted(sims, key=lambda x: x[1], reverse=True)
-
-        return {"clusters": clusters, "similarity_matrix": similarity_matrix, "keywords": valid_keywords} if return_matrix else clusters

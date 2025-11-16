@@ -13,6 +13,7 @@ from sklearn.metrics import (
 )
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
+from matplotlib.patches import Patch
 
 logger = logging.getLogger("AdvancedNewsFactor.PerformanceAnalyzer")
 models = tf.keras.models
@@ -27,7 +28,7 @@ class PerformanceAnalyzer:
         """Initialize the performance analyzer"""
         self.trading_system = trading_system
         self.data_processor = trading_system.data_processor
-        self.news_model = trading_system.data_processor.news_factor_model
+        self.news_factor_model = trading_system.data_processor.news_factor_model
         logger.info("PerformanceAnalyzer initialized with clustering capabilities")
 
     # ========================================================================
@@ -115,41 +116,34 @@ class PerformanceAnalyzer:
             embeddings: [num_news, latent_dim] - learned representations
             true_types: Ground truth news types (for validation)
         """
-        logger.info(f"Extracting embeddings for {len(news_data)} news items...")
+        logger.info("Extracting embeddings for %s news items...", len(news_data))
         
         # Get the shared news representation layer
         try:
-            embedding_layer = self.news_model.model.get_layer('shared_news_representation')
+            embedding_output = self.news_factor_model.model.get_layer('shared_news_representation').output
         except ValueError:
             logger.error("Model does not have 'shared_news_representation' layer")
             raise
         
         # Build extraction model
-        keyword_input = self.news_model.model.input[0]
-        embedding_output = embedding_layer.output
+        keyword_input = self.news_factor_model.model.input[0]
         extractor_model = models.Model(inputs=keyword_input, outputs=embedding_output)
         
         embeddings = []
         true_types = []
-        
         for news_item in news_data:
             # Tokenize
             text = news_item.get('text', '')
             if not text:
                 logger.warning("Skipping news with empty text")
                 continue
-                
-            keywords = self.data_processor.prepare_keyword_sequence(text)['input_ids']
             
-            # Ensure proper shape: [batch_size, seq_length]
-            if keywords.ndim == 3 and keywords.shape[1] == 1:
-                keywords = np.squeeze(keywords, axis=1)
-            elif keywords.ndim == 1:
-                keywords = np.expand_dims(keywords, axis=0)
-            
+            keywords = self.news_factor_model.prepare_keyword_sequence(text)
+            if keywords.ndim == 1:
+                keywords = keywords[None, :]
+
             # Extract embedding
-            embedding = extractor_model.predict(keywords, verbose=0)[0]
-            embeddings.append(embedding)
+            embeddings.append(extractor_model.predict(keywords, verbose=0)[0])
             
             # Ground truth type
             if 'news_type' in news_item:
@@ -158,7 +152,7 @@ class PerformanceAnalyzer:
                 true_types.append('unknown')
         
         embeddings = np.array(embeddings)
-        logger.info(f"✅ Extracted embeddings: shape {embeddings.shape}")
+        logger.info("✅ Extracted embeddings: shape %s", embeddings.shape)
         
         return embeddings, true_types
     
@@ -177,9 +171,9 @@ class PerformanceAnalyzer:
         Returns:
             Dict with clustering results and quality metrics
         """
-        logger.info(f"\n{'='*60}")
-        logger.info(f"UNSUPERVISED NEWS TYPE CLUSTERING ({method.upper()})")
-        logger.info(f"{'='*60}")
+        logger.info("\n%s", "=" * 60)
+        logger.info("UNSUPERVISED NEWS TYPE CLUSTERING (%s)", method.upper())
+        logger.info("%s", "=" * 60)
         
         if method == 'kmeans':
             clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -191,7 +185,7 @@ class PerformanceAnalyzer:
             predicted_clusters = clusterer.fit_predict(embeddings)
             n_clusters = len(set(predicted_clusters)) - (1 if -1 in predicted_clusters else 0)
             cluster_centers = None
-            logger.info(f"DBSCAN found {n_clusters} clusters")
+            logger.info("DBSCAN found %s clusters", n_clusters)
         else:
             raise ValueError(f"Unknown clustering method: {method}")
         
@@ -202,15 +196,15 @@ class PerformanceAnalyzer:
         else:
             silhouette = calinski = -1
         
-        logger.info(f"\nClustering Quality:")
-        logger.info(f"  Silhouette Score: {silhouette:.3f} (higher = better, max=1)")
-        logger.info(f"  Calinski-Harabasz: {calinski:.1f} (higher = better)")
+        logger.info("\nClustering Quality:")
+        logger.info("  Silhouette Score: %.3f (higher = better, max=1)", silhouette)
+        logger.info("  Calinski-Harabasz: %.1f (higher = better)", calinski)
         
         # Cluster distribution
         unique, counts = np.unique(predicted_clusters, return_counts=True)
-        logger.info(f"\nCluster Distribution:")
+        logger.info("\nCluster Distribution:")
         for cluster_id, count in zip(unique, counts):
-            logger.info(f"  Cluster {cluster_id}: {count} news ({100*count/len(embeddings):.1f}%)")
+            logger.info("  Cluster %s: %s news (%.1f%%)", cluster_id, count, 100 * count / len(embeddings))
         
         return {
             'predicted_clusters': predicted_clusters,
@@ -242,14 +236,14 @@ class PerformanceAnalyzer:
         ari = adjusted_rand_score(true_labels, predicted_clusters)
         nmi = normalized_mutual_info_score(true_labels, predicted_clusters)
         
-        logger.info(f"\n{'='*60}")
-        logger.info(f"GROUND TRUTH COMPARISON")
-        logger.info(f"{'='*60}")
-        logger.info(f"  Adjusted Rand Index: {ari:.3f} (1.0 = perfect match)")
-        logger.info(f"  Normalized Mutual Info: {nmi:.3f} (1.0 = perfect match)")
+        logger.info("\n%s", "=" * 60)
+        logger.info("GROUND TRUTH COMPARISON")
+        logger.info("%s", "=" * 60)
+        logger.info("  Adjusted Rand Index: %.3f (1.0 = perfect match)", ari)
+        logger.info("  Normalized Mutual Info: %.3f (1.0 = perfect match)", nmi)
         
         # Cluster → News Type mapping
-        logger.info(f"\nCluster → News Type Mapping:")
+        logger.info("\nCluster → News Type Mapping:")
         for cluster_id in sorted(set(predicted_clusters)):
             cluster_mask = predicted_clusters == cluster_id
             types_in_cluster = [true_types[i] for i in range(len(true_types)) if cluster_mask[i]]
@@ -259,9 +253,9 @@ class PerformanceAnalyzer:
                 dominant_type = type_counts.most_common(1)[0]
                 purity = dominant_type[1] / len(types_in_cluster)
                 
-                logger.info(f"\n  Cluster {cluster_id} (n={len(types_in_cluster)}):")
-                logger.info(f"    Dominant type: {dominant_type[0]} ({purity:.1%} purity)")
-                logger.info(f"    Distribution: {dict(type_counts)}")
+                logger.info("\n  Cluster %s (n=%s):", cluster_id, len(types_in_cluster))
+                logger.info("    Dominant type: %s (%.1f%% purity)", dominant_type[0], purity * 100)
+                logger.info("    Distribution: %s", dict(type_counts))
         
         return {
             'adjusted_rand_index': ari,
@@ -282,9 +276,9 @@ class PerformanceAnalyzer:
         Returns:
             Dict with cluster statistics
         """
-        logger.info(f"\n{'='*60}")
-        logger.info(f"CLUSTER CHARACTERISTICS ANALYSIS")
-        logger.info(f"{'='*60}")
+        logger.info("\n%s", "=" * 60)
+        logger.info("CLUSTER CHARACTERISTICS ANALYSIS")
+        logger.info("%s", "=" * 60)
         
         cluster_stats = {}
         
@@ -316,11 +310,12 @@ class PerformanceAnalyzer:
                 'top_keywords': self._get_top_keywords(keywords_all, top_k=5)
             }
             
-            logger.info(f"\nCluster {cluster_id}:")
-            logger.info(f"  Size: {cluster_stats[cluster_id]['size']}")
-            logger.info(f"  Avg Impact: {cluster_stats[cluster_id]['avg_impact']:.4f}")
-            logger.info(f"  Dominant Scope: {cluster_stats[cluster_id]['dominant_scope']}")
-            logger.info(f"  Top Keywords: {cluster_stats[cluster_id]['top_keywords']}")
+            logger.info("\nCluster %s:", cluster_id)
+            logger.info("  Size: %s", cluster_stats[cluster_id]['size'])
+            logger.info("  Avg Impact: %.4f", cluster_stats[cluster_id]['avg_impact'])
+            logger.info("  Dominant Scope: %s", cluster_stats[cluster_id]['dominant_scope'])
+            logger.info("  Top Keywords: %s", cluster_stats[cluster_id]['top_keywords'])
+
         
         return cluster_stats
     
@@ -350,9 +345,9 @@ class PerformanceAnalyzer:
         Returns:
             Comprehensive validation results
         """
-        logger.info("\n" + "="*80)
+        logger.info("\n%s", "=" * 60)
         logger.info("UNSUPERVISED NEWS TYPE DISCOVERY VALIDATION")
-        logger.info("="*80)
+        logger.info("="*60)
         
         # 1. Extract embeddings
         embeddings, true_types = self.extract_news_embeddings(news_data)
@@ -385,9 +380,9 @@ class PerformanceAnalyzer:
         )
         
         # Overall assessment
-        logger.info("\n" + "="*80)
+        logger.info("\n%s", "=" * 60)
         logger.info("OVERALL ASSESSMENT")
-        logger.info("="*80)
+        logger.info("="*60)
         
         ari = comparison_result['adjusted_rand_index']
         silhouette = clustering_result['silhouette_score']
@@ -401,9 +396,10 @@ class PerformanceAnalyzer:
         else:
             logger.info("❌ WEAK: Model does not distinguish news types well")
         
-        logger.info(f"  → Adjusted Rand Index: {ari:.3f}")
-        logger.info(f"  → Silhouette Score: {silhouette:.3f}")
-        logger.info("="*80 + "\n")
+        logger.info("  → Adjusted Rand Index: %.3f", ari)
+        logger.info("  → Silhouette Score: %.3f", silhouette)
+        logger.info("%s\n", "=" * 80)
+
         
         return {
             'embeddings': embeddings,
@@ -430,7 +426,7 @@ class PerformanceAnalyzer:
             true_types: Optional ground truth types
             save_path: Output file path
         """
-        logger.info(f"\n📊 Generating clustering visualization...")
+        logger.info("\n📊 Generating clustering visualization...")
         
         # t-SNE dimensionality reduction
         tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(embeddings)-1))
@@ -514,10 +510,8 @@ class PerformanceAnalyzer:
             ax.grid(True, alpha=0.3)
             
             # Legend
-            from matplotlib.patches import Patch
             legend_elements = [
-                Patch(facecolor=plt.cm.tab10(type_colors[t]), 
-                     edgecolor='black', label=t)
+                Patch(facecolor=plt.cm.tab10(type_colors[t]), edgecolor='black', label=t)
                 for t in unique_types
             ]
             ax.legend(handles=legend_elements, loc='best', title='News Type')
@@ -541,7 +535,7 @@ class PerformanceAnalyzer:
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        logger.info(f"✅ Saved to '{save_path}'")
+        logger.info("✅ Saved to '%s'", save_path)
         
         return fig
 
@@ -698,8 +692,8 @@ class PerformanceAnalyzer:
 
         if final_val_loss > final_train_loss * 1.5:
             logger.warning("⚠️  Possible overfitting detected!")
-            logger.warning(f"  Train loss: {final_train_loss:.4f}")
-            logger.warning(f"  Val loss: {final_val_loss:.4f}")
+            logger.warning("  Train loss: %.4f", final_train_loss)
+            logger.warning("  Val loss: %.4f", final_val_loss)
         else:
             logger.info("✅ Model generalizes well to validation data")
         
