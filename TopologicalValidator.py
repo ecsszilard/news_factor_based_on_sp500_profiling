@@ -366,20 +366,18 @@ class TopologicalValidator:
         
         # Add text box with statistics
         stats_text = (
-            "N pairs: %d\n"
-            "R: μ=%.3f, σ=%.3f\n"
-            "M: μ=%.3f, σ=%.3f\n"
-            "Correlation: %.4f"
-        ) % (len(R), R.mean(), R.std(), M.mean(), M.std(), corr_val)
+            f"N pairs: {len(R)}\n"
+            f"R: μ={R.mean():.3f}, σ={R.std():.3f}\n"
+            f"M: μ={M.mean():.3f}, σ={M.std():.3f}\n"
+            f"Correlation: {corr_val:.4f}"
+        )
         
-        ax2.text(0.98, 0.02, stats_text, transform=ax2.transAxes,
-                fontsize=10, verticalalignment='bottom', horizontalalignment='right',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        ax2.text(0.98, 0.02, stats_text, transform=ax2.transAxes, fontsize=10, verticalalignment='bottom',
+                 horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         logger.info("✅ Smoothness map saved to '%s'", save_path)
-        
         return fig
     
     def analyze_impact_vector_components(self, impact_vectors: np.ndarray):

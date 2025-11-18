@@ -59,7 +59,6 @@ class DirectionalAccuracy(metrics.Metric):
         self.correct_directions.assign(0)
         self.total_samples.assign(0)
 
-
 class WeightedNegativeLogLikelihoodLoss(losses.Loss):
     """
     Weighted Negative Log-Likelihood Loss
@@ -99,14 +98,13 @@ class WeightedNegativeLogLikelihoodLoss(losses.Loss):
         
         mu = y_pred[..., 0]  # [batch, N, N]
         log_var = y_pred[..., 1]  # [batch, N, N]
-        log_var = tf.clip_by_value(log_var, -10.0, 10.0) # to avoid underflow and overflow of exp(), which leads to an explosion of loss
+        log_var = tf.clip_by_value(log_var, -6.0, 10.0) # to avoid underflow and overflow of exp(), which leads to an explosion of loss
         
         # Ensure numerical stability
         var = tf.exp(log_var) + self.min_sigma
         
         # Standard NLL
-        squared_error = tf.square(actual_corr - mu)
-        nll = 0.5 * (squared_error / var + log_var)
+        nll = 0.5 * (tf.square(actual_corr - mu) / var + log_var)
         
         # WEIGHT 1: Affected company involvement
         # affected_mask is pre-computed: 1.0 if either i or j is in affected_companies, else 0.0
@@ -256,13 +254,13 @@ class AttentionBasedNewsFactorModel:
         # Custom optimizer with gradient clipping
         optimizer = optimizers.AdamW(
             learning_rate=optimizers.schedules.CosineDecayRestarts(
-                initial_learning_rate=1e-3,
+                initial_learning_rate=1e-4,
                 first_decay_steps=1000,
                 t_mul=2.0,
                 m_mul=0.9,
                 alpha=0.1
             ),
-            weight_decay=1e-4,
+            weight_decay=4e-5,
             clipnorm=1.0
         )
         
@@ -277,7 +275,7 @@ class AttentionBasedNewsFactorModel:
                 'news_reconstruction': 'mae'
             },
             loss_weights={
-                'correlation_changes_probabilistic': 4.0,
+                'correlation_changes_probabilistic': 3.5,
                 'price_deviations': 0.5,
                 'news_reconstruction': 0.5
             },
@@ -288,22 +286,18 @@ class AttentionBasedNewsFactorModel:
             }
         )
 
-    def build_model(self):
-        """Multi-task model with Residual Learning: baseline + news-induced delta.
-
-        Hybrid news encoder:
-        - smooth_global: robust global pooling (avg + max) -> resists small embedding jitter
-        - local_edge: pointwise Dense + sigmoid gate -> detects sharp local semantic edges,
-                    GlobalMaxPooling extracts the strongest local signal
-        - combined -> single moderate Dense -> shared_news_rep (latent)
+    def build_model(self, use_local_branch: bool = True, top_k: int = 3):
+        """Multi-task model with Residual Probabilistic Residual Learning.
+        Hybrid news encoder with controlled local-edge branch (Option 4).
+        - use_local_branch: whether to include the local edge path (toggleable)
+        - top_k: number of top activations to aggregate from local conv (soft top-k mean)
         """
 
         # -----------------------------
         # 1. Inputs
         # -----------------------------
-        keyword_input = layers.Input(shape=(self.max_keywords,), name='keywords')
-        
         # Fisher-z transformed baseline correlation matrix (square NxN)
+        keyword_input = layers.Input(shape=(self.max_keywords,), name='keywords')
         baseline_correlation_input = layers.Input(
             shape=(self.num_companies, self.num_companies),
             name='baseline_correlation_input',
@@ -311,39 +305,36 @@ class AttentionBasedNewsFactorModel:
         )
 
         # -----------------------------
-        # 2. Keyword encoder (global, not company-specific)
+        # 2. Keyword encoder (token embedding + attention)
         # -----------------------------
-        # Token embedding for keywords (sequence of tokens per news item)
         keyword_embedding = layers.Embedding(
             input_dim=len(self.tokenizer),
             output_dim=self.keyword_dim,
             mask_zero=True,
             embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='keyword_embeddings'
-        )(keyword_input)  # shape: [batch, seq_len, keyword_dim]
+        )(keyword_input)  # [batch, seq_len, keyword_dim]
 
-        # Self-attention over keywords (returns [batch, seq_len, keyword_dim])
         attn_keywords = OptimizedAttentionLayer(
             num_heads=8,
             key_dim=max(1, self.keyword_dim // 8),
-            dropout_rate=0.2,
+            dropout_rate=0.22,
             name='keyword_attention'
         )(keyword_embedding, keyword_embedding, keyword_embedding)
 
-        # Residual + LayerNorm: stable per-token representations
-        # processed shape: [batch, seq_len, keyword_dim]
-        keyword_latent = layers.LayerNormalization(name='keywords_layer_norm')(attn_keywords + keyword_embedding)
+        # Residual connection + LayerNorm for stable per-token features
+        processed_keywords = layers.LayerNormalization(name='keywords_layer_norm')(attn_keywords + keyword_embedding) # shape: [batch, seq_len, keyword_dim]
 
         # -----------------------------
-        # 3. News representation aggregation
+        # 3. Smooth global branch (robust)
         # -----------------------------
         # Average + Max pooling across tokens -> stable global descriptor
         news_features = layers.Concatenate(name='news_smooth_global')([
-            layers.GlobalAveragePooling1D(name='keywords_global_avg')(keyword_latent),
-            layers.GlobalMaxPooling1D(name='keywords_global_max')(keyword_latent)
+            layers.GlobalAveragePooling1D(name='keywords_global_avg')(processed_keywords),
+            layers.GlobalMaxPooling1D(name='keywords_global_max')(processed_keywords)
         ]) # [batch, 2*keyword_dim]
 
-        # Optionally reduce dimensionality of smooth branch (small projection)
+        # Small projection to latent_dim (keeps global descriptor compact and regularized)
         smooth_global = layers.Dense(
             self.latent_dim,
             activation='relu',
@@ -351,32 +342,79 @@ class AttentionBasedNewsFactorModel:
             name='smooth_global_proj'
         )(news_features)  # [batch, latent_dim]
 
-        # --- Local edge branch: detect sharp local semantic flips ---
-        # 1D convolutional layer is able to examine n-grams (e.g. kernel 3 = 3 words) at once, making it much more robust in recognizing "semantic edges" and less prone to noise.
-        local_conv = layers.Conv1D(
-            filters=self.latent_dim,
-            kernel_size=3,
-            padding='same',  # Megtartja a szekvencia hosszát
-            activation='relu',
-            kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
-            name='local_conv_bank'
-        )(keyword_latent)  # [batch, seq_len, latent_dim]
+        # -----------------------------
+        # 4. Controlled local branch (OPTIONAL, robustified)
+        # -----------------------------
+        if use_local_branch:
 
-        # Gating mechanism: sigmoid gate computed from processed tokens, this enables the network to selectively amplify or silence local signals.
-        local_gate = layers.Dense(
-            self.latent_dim,
-            activation='sigmoid',
-            name='local_gate'
-        )(keyword_latent)  # [batch, seq_len, latent_dim]
+            # 4.a Small conv filter bank
+            local_filters = max(32, self.latent_dim // 4)
+            # 1D convolutional layer is able to examine n-grams (e.g. kernel 3 = 3 words) at once, making it much more robust in recognizing "semantic edges" and less prone to noise.
+            local_conv = layers.Conv1D(
+                filters=local_filters,
+                kernel_size=3,
+                padding='same',
+                activation='relu',
+                kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
+                name='local_conv_small'
+            )(processed_keywords)  # [batch, seq_len, local_filters]
 
-        # Elementwise multiply: gated local features
-        gated_local = layers.Multiply(name='gated_local')([local_conv, local_gate])  # [batch, seq_len, latent_dim]
+            # 4.b Gate over conv features
+            # We add a learnable temperature scalar to the gate input and use a sigmoid.
+            # The temperature is implemented as a small Dense with linear output and non-negative constraint below.
+            gate_logits = layers.Dense(
+                local_filters,
+                activation=None,
+                kernel_regularizer=regularizers.l1_l2(1e-6),
+                name='local_gate_logits'
+            )(processed_keywords)  # [batch, seq_len, local_filters]
 
-        # Global max over timesteps picks the strongest "edge" activation per latent channel
-        local_edge = layers.GlobalMaxPooling1D(name='local_edge_pool')(gated_local)  # [batch, latent_dim]
+            # Temperature (simple scalar) applied through softplus for positivity
+            temp = tf.Variable(1.0, trainable=True, dtype=tf.float32, name="gate_temperature")
+            temp_pos = tf.nn.softplus(temp)
 
-        # --- Combine smooth and local branches ---
-        combined = layers.Concatenate(name='news_combined')([smooth_global, local_edge])  # [batch, 2*latent_dim]
+            # Apply temperature scaling
+            local_gate = layers.Activation(lambda x: tf.sigmoid(x * temp_pos), name='local_gate')(gate_logits)
+
+            # L1 activity regularization ON THE GATE
+            local_gate = layers.ActivityRegularization(l1=1e-3, name='local_gate_activity')(local_gate)
+
+            # 4.c Elementwise multiply conv features with gate
+            gated_local = layers.Multiply(name='gated_local')([local_conv, local_gate])  # [batch, seq_len, local_filters]
+
+            # 4.d Top-k mean pooling implemented inside Lambda (no symbolic Python ops)
+            def top_k_mean(x):
+                # x shape: [batch, seq_len, filters]
+                # transpose so we perform top-k over seq_len for each filter
+                x_t = tf.transpose(x, [0, 2, 1])  # [batch, filters, seq_len]
+                values, _ = tf.nn.top_k(x_t, k=top_k)  # [batch, filters, k]
+                return tf.reduce_mean(values, axis=-1)  # [batch, filters]
+
+            local_edge = layers.Lambda(top_k_mean, name='local_topk')(gated_local)
+
+            # 4.e Small dropout on local_edge to further reduce overfitting
+            local_edge = layers.Dropout(0.4, name='local_edge_dropout')(local_edge)
+
+            # 4.f Projection to latent_dim to match smooth_global size
+            local_edge_proj = layers.Dense(
+                self.latent_dim,
+                activation='relu',
+                kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
+                name='local_edge_proj'
+            )(local_edge)
+
+        else:
+            # Disabled mode (ablation)
+            local_edge_proj = layers.Lambda(
+                lambda x: tf.zeros([tf.shape(x)[0], self.latent_dim], dtype=tf.float32),
+                name='local_edge_disabled'
+            )(keyword_input)
+        local_edge_proj = layers.ActivityRegularization(l2=1e-4)(local_edge_proj)
+
+        # -----------------------------
+        # 5. Combine branches -> shared_news_rep
+        # -----------------------------
+        combined = layers.Concatenate(name='news_combined')([smooth_global, local_edge_proj])  # [batch, 2*latent_dim]
 
         # Single moderate Dense to produce final shared news representation
         # Keep this layer intentionally small/cautious to avoid creating "bumpiness".
@@ -389,10 +427,10 @@ class AttentionBasedNewsFactorModel:
 
         # Use LayerNorm (not BatchNorm) and small Dropout for stability without erasing edges
         shared_news_rep = layers.LayerNormalization(name='shared_news_layernorm')(shared_news_rep)
-        shared_news_rep = layers.Dropout(0.2, name='shared_news_dropout')(shared_news_rep)
+        shared_news_rep = layers.Dropout(0.31, name='shared_news_dropout')(shared_news_rep)
 
         # -----------------------------
-        # 4. Company embeddings (for pairwise features only)
+        # 6. Company embeddings (for pairwise features only)
         # -----------------------------
         # Create learnable company embeddings for ALL companies
         company_embedding_layer = layers.Embedding(
@@ -401,17 +439,14 @@ class AttentionBasedNewsFactorModel:
             embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='company_embeddings'
         )
-        
+
         # Get embeddings for all companies repeating across batch dimension
         batch_size = tf.shape(keyword_input)[0]
         all_company_indices = tf.range(self.num_companies, dtype=tf.int32)
         all_company_indices = tf.expand_dims(all_company_indices, 0)
-        all_company_indices = tf.tile(all_company_indices, [batch_size, 1])  # [batch, N]
+        all_company_indices = tf.tile(all_company_indices, [batch_size, 1]) # [batch, N]
         all_company_embeddings = company_embedding_layer(all_company_indices)  # [batch, N, company_dim]
 
-        # -----------------------------
-        # 5. Pairwise correlation features (all company pairs)
-        # -----------------------------
         # Create pairwise features: for each pair (i,j), concatenate [company_i, company_j, news]
         # company_i: [batch, N, 1, company_dim] -> tile to [batch, N, N, company_dim]
         company_i = layers.Lambda(lambda x: tf.expand_dims(x, 2), name='company_i_expand')(all_company_embeddings)
@@ -423,27 +458,23 @@ class AttentionBasedNewsFactorModel:
 
         # shared_news_rep: [batch, latent] -> expand to [batch, N, N, latent]
         news_expanded = layers.Lambda(lambda x: tf.expand_dims(tf.expand_dims(x, 1), 1), name='news_expand')(shared_news_rep)  # [batch,1,1,latent]
-        news_for_pairs = layers.Lambda(
-            lambda x: tf.tile(x, [1, self.num_companies, self.num_companies, 1]),
-            name='news_tile_for_pairs'
-        )(news_expanded)  # [batch, N, N, latent]
+        news_for_pairs = layers.Lambda(lambda x: tf.tile(x, [1, self.num_companies, self.num_companies, 1]), name='news_tile_for_pairs')(news_expanded) # [batch, N, N, latent]
 
         # Concatenate company_i, company_j, news_for_pairs along the last axis
-        pairwise_features = layers.Concatenate(axis=-1, name='pairwise_concat')([company_i, company_j, news_for_pairs])
-        # shape: [batch, N, N, 2*company_dim + latent]
+        pairwise_features = layers.Concatenate(axis=-1, name='pairwise_concat')([company_i, company_j, news_for_pairs]) # shape: [batch, N, N, 2*company_dim + latent]
 
         # -----------------------------
-        # 6. PROBABILISTIC RESIDUAL LEARNING: Predict correlation CHANGE (delta)
+        # 7. Probabilistic residual head: Predict correlation CHANGE (delta)
         # -----------------------------
         # Flatten baseline correlation into a channel for concatenation
         baseline_flat = layers.Reshape((self.num_companies, self.num_companies, 1), name='baseline_reshape')(baseline_correlation_input)
-        
+
         # Merge pairwise features with baseline correlation
         merged_features = layers.Concatenate(axis=-1, name='merged_features_with_baseline')([
             pairwise_features,
             baseline_flat
         ])  # shape: [batch, N, N, 2*company_dim + latent + 1]
-        
+
         # Shared hidden layer for both μ and log-variance predictions
         delta_hidden = layers.Dense(
             128,
@@ -451,81 +482,38 @@ class AttentionBasedNewsFactorModel:
             kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='delta_hidden_shared'
         )(merged_features)
-        delta_hidden = layers.Dropout(0.45, name='delta_hidden_dropout')(delta_hidden)
-        
+        delta_hidden = layers.Dropout(0.4, name='delta_hidden_dropout')(delta_hidden)
         # TWO SEPARATE DENSE LAYERS for different predictions for Mean (μ) and Log-Variance (log σ²)
-        
+
         # μ: expected correlation change
-        delta_mu_raw = layers.Dense(
-            1,
-            activation='linear',
-            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
-            name='correlation_delta_mu'
-        )(delta_hidden)  # [batch, N, N, 1]
-        
-        delta_mu = layers.Reshape(
-            (self.num_companies, self.num_companies),
-            name='delta_mu_reshaped'
-        )(delta_mu_raw)  # [batch, N, N]
+        delta_mu_raw = layers.Dense(1, activation='linear', name='correlation_delta_mu')(delta_hidden) # [batch, N, N, 1]
+        delta_mu = layers.Reshape((self.num_companies, self.num_companies), name='delta_mu_reshaped')(delta_mu_raw) # [batch, N, N]
 
         # log(σ²): aleatoric uncertainty
-        delta_log_var_raw = layers.Dense(
-            1,
-            activation='linear',
-            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
-            name='correlation_delta_log_var'
-        )(delta_hidden)  # [batch, N, N, 1]
-
-        delta_log_var = layers.Reshape(
-            (self.num_companies, self.num_companies),
-            name='delta_log_var_reshaped'
-        )(delta_log_var_raw)  # [batch, N, N]
+        delta_log_var_raw = layers.Dense(1, activation='linear', name='correlation_delta_log_var')(delta_hidden)  # [batch, N, N, 1]
+        delta_log_var_clipped = layers.Lambda(lambda x: tf.clip_by_value(x, -1.1, 5.9), name='delta_log_var_clipped')(delta_log_var_raw)
+        delta_log_var = layers.Reshape((self.num_companies, self.num_companies), name='delta_log_var_reshaped')(delta_log_var_clipped)  # [batch, N, N]
 
         # Ensure symmetry for μ and log_var (average with transpose)
-        delta_mu_symmetric = layers.Lambda(
-            lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])),
-            name='correlation_delta_mu_symmetric'
-        )(delta_mu)
-
-        delta_log_var_symmetric = layers.Lambda(
-            lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])),
-            name='correlation_delta_log_var_symmetric'
-        )(delta_log_var)
+        delta_mu_symmetric = layers.Lambda(lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])), name='correlation_delta_mu_symmetric')(delta_mu)
+        delta_log_var_symmetric = layers.Lambda(lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])), name='correlation_delta_log_var_symmetric')(delta_log_var)
 
         # Residual connection: baseline + μ_delta -> predicted mean correlation
-        correlation_mean = layers.Add(name='correlation_mean_prediction')([
-            baseline_correlation_input,
-            delta_mu_symmetric
-        ])  # [batch, N, N]
-
+        correlation_mean = layers.Add(name='correlation_mean_prediction')([baseline_correlation_input, delta_mu_symmetric])
         # Stack mean and log-variance for downstream probabilistic loss
-        correlation_changes_prob = layers.Lambda(
-            lambda tensors: tf.stack(tensors, axis=-1),
-            name='correlation_changes_probabilistic'
-        )([correlation_mean, delta_log_var_symmetric])  # [batch, N, N, 2]
+        correlation_changes_prob = layers.Lambda(lambda tensors: tf.stack(tensors, axis=-1), name='correlation_changes_probabilistic')([correlation_mean, delta_log_var_symmetric]) # [batch, N, N, 2]
 
         # -----------------------------
-        # 7. Price deviations (auxiliary task)
+        # 8. Price deviations & reconstruction heads
         # -----------------------------
         # For price deviation, use shared_news_rep combined with flattened company embeddings
         price_dev_input = layers.Concatenate(name='price_dev_input')([shared_news_rep, layers.Flatten()(all_company_embeddings)])
-        price_dev_hidden = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l1_l2(1e-5), name='price_dev_hidden')(price_dev_input)
-        price_dev_hidden = layers.Dropout(0.3, name='price_dev_dropout')(price_dev_hidden)
-        price_deviations = layers.Dense(
-            self.num_companies,
-            activation='tanh',
-            name='price_deviations'
-        )(price_dev_hidden)  # [batch, N]
+        price_dev_hidden = layers.Dense(128, activation='relu', name='price_dev_hidden')(price_dev_input)
+        price_dev_hidden = layers.Dropout(0.29, name='price_dev_dropout')(price_dev_hidden)
+        price_deviations = layers.Dense(self.num_companies, activation='tanh', name='price_deviations')(price_dev_hidden) # [batch, N]
 
-        # -----------------------------
-        # 8. News reconstruction (auxiliary task)
-        # -----------------------------
         # Encourage shared_news_rep to preserve reconstructible information
-        recon_out = layers.Dense(
-            self.latent_dim,
-            activation='tanh',
-            name='news_reconstruction'
-        )(shared_news_rep)  # [batch, latent_dim]
+        recon_out = layers.Dense(self.latent_dim, activation='tanh', name='news_reconstruction')(shared_news_rep) # [batch, latent_dim]
 
         # -----------------------------
         # Build and return the Model
@@ -535,7 +523,6 @@ class AttentionBasedNewsFactorModel:
             outputs=[correlation_changes_prob, price_deviations, recon_out],
             name='NewsCorrelationProbabilisticResidualModel'
         )
-
 
     def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
         """Train the probabilistic residual correlation model"""
@@ -662,7 +649,7 @@ class AttentionBasedNewsFactorModel:
             n_samples: Number of MC Dropout samples (default: 10)
 
         Returns:
-            Dict with mean, std (total), epistemic_std, aleatoric_std, and confidence scores
+            Dict
         """
 
         # ----------------------------
@@ -688,54 +675,52 @@ class AttentionBasedNewsFactorModel:
         mc_mu, mc_logvar = [], []
         keywords_tf = tf.convert_to_tensor(keywords, dtype=tf.int32)
         baseline_tf = tf.convert_to_tensor(baseline_correlation, dtype=tf.float32)
+        
         for _ in range(n_samples):
             # Use __call__() instead of predict() to respect training=True, this ensures Dropout layers are active during inference
-            pred = self.model.call([keywords_tf, baseline_tf], training=True)
+            pred = self.model([keywords_tf, baseline_tf], training=True)
             
             mu_sample = pred[0][..., 0].numpy()
             logvar_sample = pred[0][..., 1].numpy()
-
             mc_mu.append(mu_sample)
             mc_logvar.append(logvar_sample)
         
-        mc_mu = np.array(mc_mu)
-        mc_logvar = np.array(mc_logvar)
+        mc_mu = np.stack(mc_mu, axis=0)
+        mc_logvar = np.stack(mc_logvar, axis=0)
 
         # ----------------------------
         # 3) Uncertainty decomposition
         # ----------------------------
         epistemic_var = np.var(mc_mu, axis=0) # Epistemic uncertainty: variance across MC samples
         aleatoric_var = np.mean(np.exp(mc_logvar) + 1e-6, axis=0) # Aleatoric uncertainty: average of predicted variances
-
-        sigma_epistemic = np.sqrt(epistemic_var)
-        sigma_aleatoric = np.sqrt(aleatoric_var)
-        sigma_total = np.sqrt(epistemic_var + aleatoric_var)
+        sigma = np.sqrt(epistemic_var + aleatoric_var)
 
         # ----------------------------
         # 4) Reconstruction error (using predict for final deterministic output)
         # ----------------------------
         final_pred = self.model.predict([keywords, baseline_correlation], verbose=0)
         recon_prediction = final_pred[2]  # shape [1, latent_dim]
-
         min_len = min(recon_prediction.shape[-1], news_target_embedding.shape[-1])
         recon_error = np.mean(np.abs(news_target_embedding[..., :min_len] - recon_prediction[..., :min_len]))
 
         # ----------------------------
         # 5) Confidence scores
         # ----------------------------
+        epistemic_conf = 1.0 / (1.0 + np.sqrt(epistemic_var).mean())
+        aleatoric_conf = 1.0 / (1.0 + np.sqrt(aleatoric_var).mean())
+        unc_conf = 1.0 / (1.0 + sigma.mean())
         recon_conf = np.exp(-recon_error)
-        unc_conf = 1.0 / (1.0 + sigma_total.mean())
 
         return {
             "mean": np.mean(mc_mu, axis=0),
-            "std": sigma_total,
-            "epistemic_std": sigma_epistemic,
-            "aleatoric_std": sigma_aleatoric,
-            "total_confidence": recon_conf * unc_conf,
-            "recon_confidence": recon_conf,
-            "uncertainty_confidence": unc_conf,
+            "std": sigma,
             "price_deviations": final_pred[1],
             "reconstruction_error": recon_error,
+            "epistemic_conf": epistemic_conf,
+            "aleatoric_conf": aleatoric_conf,
+            "uncertainty_conf": unc_conf,
+            "recon_conf": recon_conf,
+            "total_conf": recon_conf * unc_conf
         }
     
     def prepare_keyword_sequence(self, text: str) -> np.ndarray:

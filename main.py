@@ -91,7 +91,7 @@ if __name__ == "__main__":
     history = news_model.train(
         training_data=training_data,
         validation_data=validation_data,
-        epochs=50,
+        epochs=60,
         batch_size=8
         )
 
@@ -149,8 +149,8 @@ if __name__ == "__main__":
     # Analyze first 10 companies
     target_companies = list(sample_prices.keys())[:10]
     news_impact = trading_system.predict_news_impact(
-        test_news, 
-        target_companies, 
+        test_news,
+        target_companies,
         affected_companies_test
     )
 

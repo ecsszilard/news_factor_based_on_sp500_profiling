@@ -54,8 +54,8 @@ class Utils:
     
     def create_hybrid_data(self, 
                           num_companies: int = 20,
-                          num_news: int = 200,
-                          days: int = 100,
+                          num_news: int = 600,
+                          days: int = 350,
                           train_ratio: float = 0.7):
         """
         Hibrid adatgenerálás: realisztikus ár- és hírgenerálás fejlett szimulációval

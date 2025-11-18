@@ -70,7 +70,7 @@ class AdvancedTradingSystem:
             'improvement_over_baseline': improvement,
             'improvement_percentage': improvement_pct,
             'avg_sigma_z': np.mean(sigma),
-            'confidence_score': predictions['confidence']['total_confidence']
+            'confidence_score': predictions['total_confidence']
         }
     
     def _classify_news_scope(self, news_text, mentioned_companies):
@@ -189,7 +189,7 @@ class AdvancedTradingSystem:
         # Extract probabilistic predictions
         mu_z = predictions['mean'][0]  # [N, N] - μ in Fisher-z space
         sigma_z = predictions['std'][0]    # [N, N] - σ (uncertainty)
-        total_confidence = predictions['total_confidence']
+        total_confidence = predictions['total_conf']
 
         # Convert back to correlation space
         predicted_corr = self.data_processor.inverse_fisher_z_transform(mu_z)
@@ -243,13 +243,16 @@ class AdvancedTradingSystem:
             
             results[company] = {
                 'predicted_corr': predicted_corr,
+                'uncertainty_matrix': sigma_z,
                 'baseline_corr': baseline_corr,
                 'delta_corr': delta_corr,
                 'sigma_corr' : sigma_corr,
-                'total_confidence': total_confidence,
-                'recon_confidence': predictions['recon_confidence'],
-                'uncertainty_confidence': predictions['uncertainty_confidence'],
                 'reconstruction_error': float(predictions['reconstruction_error']),
+                "epistemic_confidence": float(predictions['epistemic_conf']),
+                "aleatoric_confidence": float(predictions['aleatoric_conf']),
+                "uncertainty_confidence": float(predictions['uncertainty_conf']),
+                "recon_confidence": float(predictions['recon_conf']),
+                'total_confidence': total_confidence,
                 'news_scope': news_scope,
                 'affected_companies': affected_companies,
                 'tradeable': tradeable,
@@ -262,8 +265,7 @@ class AdvancedTradingSystem:
                     'predicted_avg': float(np.mean(predicted_corr[company_idx_in_list, :]))
                 },
                 'price_impact': float(predictions['price_deviations'][0][company_idx_in_list]),
-                'similar_companies': similar_companies[:5],
-                'uncertainty_matrix': sigma_z
+                'similar_companies': similar_companies[:5]
             }
         return results
     
@@ -357,7 +359,7 @@ class AdvancedTradingSystem:
         
         # Sort by risk-adjusted score
         signals.sort(
-            key=lambda x: (x['strength'] * x['confidence']) / (x['uncertainty'] + 0.1), 
+            key=lambda x: (x['strength'] * x['total_confidence']) / (x['uncertainty'] + 0.1), 
             reverse=True
         )
         return signals
@@ -401,7 +403,7 @@ class AdvancedTradingSystem:
             logger.info(
                 "Trade executed: %s %s $%.2f (conf: %.3f, σ: %.3f, Δcorr: %.3f)",
                 signal["type"], signal["company"], signal["position_size"],
-                signal["confidence"], signal["uncertainty"],
+                signal["total_confidence"], signal["uncertainty"],
                 signal.get("correlation_impact", {}).get("max_change", 0.0),
             )
         
@@ -424,7 +426,7 @@ class AdvancedTradingSystem:
                 'uncertainty_threshold': self.uncertainty_threshold
             }, f)
         
-        logger.info(f"Probabilistic models and data saved: {path}")
+        logger.info("Probabilistic models and data saved: %s", path)
         
     def load_model_and_data(self, path='probabilistic_correlation_models'):
         """Load the probabilistic correlation model and associated data"""

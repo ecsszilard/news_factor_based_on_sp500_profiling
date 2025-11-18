@@ -511,7 +511,7 @@ class PerformanceAnalyzer:
             
             # Legend
             legend_elements = [
-                Patch(facecolor=plt.cm.tab10(type_colors[t]), edgecolor='black', label=t)
+                Patch(facecolor=plt.cm.get_cmap("tab10")(type_colors[t]), edgecolor='black', label=t)
                 for t in unique_types
             ]
             ax.legend(handles=legend_elements, loc='best', title='News Type')
@@ -553,8 +553,7 @@ class PerformanceAnalyzer:
         delta_corr = analysis['delta_corr']
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f'Probabilistic Prediction Analysis\nNews: "{news_text[:80]}..."', 
-                    fontsize=14, fontweight='bold')
+        fig.suptitle(f'Probabilistic Prediction Analysis\nNews: "{news_text[:80]}..."', fontsize=14, fontweight='bold')
         
         # 1. Correlation Heatmap with Uncertainty
         ax1 = axes[0, 0]
@@ -597,13 +596,13 @@ class PerformanceAnalyzer:
         
         # 4. Confidence Breakdown
         ax4 = axes[1, 1]
-        components = ['Total\nConfidence', 'Reconstruction\n(Epistemic)', 'Uncertainty\n(Total)', 'Epistemic\n(MC Dropout)', 'Aleatoric\n(Data)']
+        components = ['Epistemic\n(MC Dropout)', 'Aleatoric\n(Data)', 'Uncertainty\n(Total)', 'Reconstruction\n(Epistemic)', 'Total\nConfidence' ]
         values = [
-            analysis['total_confidence'],
-            analysis['recon_confidence'],
+            analysis['epistemic_confidence'],
+            analysis['aleatoric_confidence'],
             analysis['uncertainty_confidence'],
-            analysis.get('epistemic_confidence', 0.5),  # New: MC Dropout
-            1.0 / (1.0 + analysis.get('aleatoric_uncertainty', 0.3))  # New: Data noise
+            analysis['recon_confidence'],
+            analysis['total_confidence']
         ]
         colors = ['green', 'blue', 'orange', 'purple', 'red']
         bars = ax4.bar(components, values, color=colors, alpha=0.7, edgecolor='black', linewidth=2)
@@ -620,13 +619,8 @@ class PerformanceAnalyzer:
             ax4.text(bar.get_x() + bar.get_width()/2., height + 0.02, f'{val:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
         
         # Statistics
-        uncertainty_matrix = analysis.get('uncertainty_matrix', sigma_corr)
-        epistemic_unc = analysis.get('epistemic_uncertainty', 0)
-        aleatoric_unc = analysis.get('aleatoric_uncertainty', 0)
-        
+        uncertainty_matrix = analysis['uncertainty_matrix']
         stats_text = f"Avg σ_total: {np.mean(uncertainty_matrix):.4f}\n"
-        stats_text += f"σ_epistemic: {epistemic_unc:.4f}\n"
-        stats_text += f"σ_aleatoric: {aleatoric_unc:.4f}\n"
         stats_text += f"Max σ: {np.max(uncertainty_matrix):.4f}\n"
         stats_text += f"High uncertainty pairs: {np.sum(uncertainty_matrix > 0.3)}/{len(companies)**2}"
         ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -696,7 +690,6 @@ class PerformanceAnalyzer:
             logger.warning("  Val loss: %.4f", final_val_loss)
         else:
             logger.info("✅ Model generalizes well to validation data")
-        
         return fig
     
     def plot_calibration_curve(self, predictions, actuals):
