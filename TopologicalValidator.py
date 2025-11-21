@@ -35,10 +35,6 @@ class TopologicalValidator:
         self.performance_analyzer = performance_analyzer
         self.trading_system = performance_analyzer.trading_system
         self.data_processor = performance_analyzer.trading_system.data_processor
-        self.news_factor_model = performance_analyzer.trading_system.data_processor.news_factor_model
-
-        self.keyword_embedding_layer = self.news_factor_model.model.get_layer("keyword_embeddings")
-        self.company_embedding_layer = self.news_factor_model.model.get_layer("company_embeddings")
         
         logger.info("TopologicalValidator initialized")
     
@@ -150,24 +146,24 @@ class TopologicalValidator:
             news_text = news_item.get('text', '')
             
             # Predict with uncertainty
-            predictions = self.news_factor_model.predict_with_uncertainty(news_text, self.data_processor.baseline_z, 10)
+            predictions = self.trading_system.predict_news_impact(news_text)
             
             # Extract predictions
-            mu = predictions['mean'][0]  # [N, N]
-            sigma = predictions['std'][0]  # [N, N]
-            P = predictions['price_deviations'][0]  # [N]
+            mu_z = predictions[next(iter(predictions))]['mu_z']  # [N, N]
+            sigma_z = predictions[next(iter(predictions))]['sigma_z']  # [N, N]
+            price_deviations = predictions[next(iter(predictions))]['price_deviations']  # [N]
             
             # Compute delta: Δ = μ - baseline
-            delta = mu - self.data_processor.baseline_z
+            delta = mu_z - self.data_processor.baseline_z
             
             # Create 6D impact vector
             impact_vector = np.array([
-                np.mean(np.abs(delta)),  # Mean absolute correlation change
-                np.std(delta),           # Std of correlation change
-                np.mean(sigma),          # Mean uncertainty
-                np.std(sigma),           # Std of uncertainty
-                np.mean(np.abs(P)),      # Mean absolute price deviation
-                np.std(P)                # Std of price deviation
+                np.mean(np.abs(delta)),            # Mean absolute correlation change
+                np.std(delta),                     # Std of correlation change
+                np.mean(sigma_z),                  # Mean uncertainty
+                np.std(sigma_z),                   # Std of uncertainty
+                np.mean(np.abs(price_deviations)), # Mean absolute price deviation
+                np.std(price_deviations)           # Std of price deviation
             ])
             
             impact_vectors.append(impact_vector)
@@ -177,7 +173,6 @@ class TopologicalValidator:
         
         impact_vectors = np.array(impact_vectors)
         logger.info("✅ Impact vectors computed: shape %s", str(impact_vectors.shape))
-        
         return impact_vectors
     
     def validate_smoothness(self, 
@@ -443,7 +438,7 @@ class TopologicalValidator:
             target_key=target_company,
             idx_lookup={symbol: i for i, symbol in enumerate(self.data_processor.companies)},
             name_lookup={i: symbol for i, symbol in enumerate(self.data_processor.companies)},
-            embedding_layer=self.company_embedding_layer,
+            embedding_layer=self.data_processor.news_factor_model.model.get_layer("company_embeddings"),
             top_k=top_k
         )
 
@@ -456,7 +451,7 @@ class TopologicalValidator:
             target_key=target_word,
             idx_lookup=self.trading_system.word_to_idx,
             name_lookup=self.trading_system.idx_to_word,
-            embedding_layer=self.keyword_embedding_layer,
+            embedding_layer=self.data_processor.news_factor_model.model.get_layer("keyword_embeddings"),
             top_k=top_k,
             invalid_tokens={"[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"},
         )

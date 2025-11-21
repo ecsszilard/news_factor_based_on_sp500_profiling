@@ -18,64 +18,87 @@ regularizers = tf.keras.regularizers
 callbacks = tf.keras.callbacks
 metrics = tf.keras.metrics
 losses = tf.keras.losses
+initializers = tf.keras.initializers
 
-class DirectionalAccuracy(metrics.Metric):
+class HighConfidenceDirectionalAccuracy(metrics.Metric):
     """
-    Measures the model's accuracy in predicting the correct direction of change (delta).
-    Compares the sign of predicted_delta with the sign of actual_delta.
+    Measures how often the model predicts the *correct direction* of correlation change
+    (delta = actual_corr - baseline_corr), but ONLY on pairs where the model is confident.
+    
+    Why this metric?
+    - If the model's predicted uncertainty (sigma) is low, it claims to be confident.
+    - We then check: did it at least guess the direction correctly?
+    - This reveals whether "high confidence" output is actually trustworthy.
     """
-    def __init__(self, name='directional_accuracy', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.correct_directions = self.add_weight(name='correct_directions', initializer='zeros')
-        self.total_samples = self.add_weight(name='total_samples', initializer='zeros')
+
+    def __init__(self, sigma_threshold, min_sigma, **kwargs):
+        super().__init__(**kwargs)
+        self.sigma_threshold = sigma_threshold
+        self.min_sigma = min_sigma
+        self.correct_high_conf = self.add_weight(name='correct_high_conf', initializer='zeros')
+        self.total_high_conf   = self.add_weight(name='total_high_conf',   initializer='zeros')
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        """
-        y_true: [batch, N, N, 3] - [actual_corr, baseline_corr, affected_companies_mask]
-        y_pred: [batch, N, N, 2] - [μ, log(σ²)]
-        """
-        actual_corr = y_true[..., 0]
+
+        actual_corr   = y_true[..., 0]
         baseline_corr = y_true[..., 1]
+
+        mu        = y_pred[..., 0]
+        raw_logvar = y_pred[..., 1]
+
+        # Convert predicted log-variance into standard deviation (sigma)
+        # softplus ensures positivity; sqrt converts variance → std dev
+        sigma = tf.sqrt(tf.nn.softplus(raw_logvar) + self.min_sigma)
+
+        # Only evaluate pairs where the model claims "low uncertainty"
+        high_conf_mask = tf.less(sigma, self.sigma_threshold)
+
+        # Delta = correlation change relative to baseline
         actual_delta = actual_corr - baseline_corr
+        pred_delta   = mu          - baseline_corr
 
-        predicted_mu = y_pred[..., 0]  # Model predicts Z_utan
-        predicted_delta = predicted_mu - baseline_corr
+        # Ignore "near-zero" true deltas: no real direction exists
+        eps = 1e-4
+        valid_direction_mask = tf.greater(tf.abs(actual_delta), eps)
 
-        actual_sign = tf.math.sign(actual_delta)
-        predicted_sign = tf.math.sign(predicted_delta)
+        # Check if model predicted the correct direction (sign)
+        correct = tf.equal(tf.sign(actual_delta), tf.sign(pred_delta))
+        correct = tf.logical_and(correct, valid_direction_mask)
 
-        non_zero_mask = tf.math.not_equal(actual_sign, 0)
+        # Combine: correct AND model was confident
+        correct_and_confident = tf.logical_and(correct, high_conf_mask)
 
-        correct = tf.equal(actual_sign, predicted_sign)
-        correct_non_zero = tf.logical_and(correct, non_zero_mask)
-
-        self.correct_directions.assign_add(tf.reduce_sum(tf.cast(correct_non_zero, tf.float32)))
-        self.total_samples.assign_add(tf.reduce_sum(tf.cast(non_zero_mask, tf.float32)))
+        self.correct_high_conf.assign_add(tf.reduce_sum(tf.cast(correct_and_confident, tf.float32)))
+        self.total_high_conf.assign_add(tf.reduce_sum(tf.cast(high_conf_mask, tf.float32)))
 
     def result(self):
-        return self.correct_directions / (self.total_samples + 1e-7)
+        return tf.math.divide_no_nan(self.correct_high_conf, self.total_high_conf)
 
     def reset_state(self):
-        self.correct_directions.assign(0)
-        self.total_samples.assign(0)
+        self.correct_high_conf.assign(0.0)
+        self.total_high_conf.assign(0.0)
 
 class WeightedNegativeLogLikelihoodLoss(losses.Loss):
     """
-    Weighted Negative Log-Likelihood Loss
-    
-    Weights pairs by:
-    1. Involvement of ACTUALLY AFFECTED companies (from affected_companies mask)
-    2. Magnitude of actual correlation change
-    
-    This forces the model to prioritize learning pairs that:
-    - Are directly affected by the news (not just focus company)
-    - Show significant real changes
+    Stable, weighted negative log-likelihood loss for probabilistic (mu, log-var) outputs.
+
+    - Ensures numerical stability via logvar clipping and softplus-based positive variance.
+    - Emphasizes important pairs using affected-company and magnitude-based weighting (normalized to mean 1).
+    - Adds an optional variance-floor penalty to prevent overconfidence (variance collapse).
     """
-    def __init__(self, min_sigma=1e-4, affected_weight=3.0, magnitude_weight=2.0, **kwargs):
+    def __init__(self, 
+                 min_sigma, 
+                 affected_weight, 
+                 magnitude_weight, 
+                 variance_penalty_weight,
+                 variance_floor,
+                 **kwargs):
         super().__init__(**kwargs)
-        self.min_sigma = min_sigma
-        self.affected_weight = affected_weight  # Weight for pairs involving affected companies
-        self.magnitude_weight = magnitude_weight  # Weight for high-change pairs
+        self.min_sigma = float(min_sigma)
+        self.affected_weight = float(affected_weight) # weight for pairs involving affected companies
+        self.magnitude_weight = float(magnitude_weight) # weight for high-change pairs
+        self.variance_penalty_weight = float(variance_penalty_weight) # minimum variance to prevent overconfidence
+        self.variance_floor = float(variance_floor)
     
     def get_config(self):
         config = super().get_config()
@@ -83,51 +106,56 @@ class WeightedNegativeLogLikelihoodLoss(losses.Loss):
             'min_sigma': self.min_sigma,
             'affected_weight': self.affected_weight,
             'magnitude_weight': self.magnitude_weight,
+            'variance_penalty_weight': self.variance_penalty_weight,
+            'variance_floor': self.variance_floor
         })
         return config
     
     def call(self, y_true, y_pred):
         """
-        y_true: [batch, N, N, 3] - [actual_corr, baseline_corr, affected_companies_mask]
-        y_pred: [batch, N, N, 2] - [μ, log(σ²)]
+        y_true: [batch, N, N, 3] -> [actual_corr, baseline_corr, affected_mask]
+        y_pred: [batch, N, N, 2] -> [mu, raw_logvar_pred]
         """
-        # Extract components
-        actual_corr = y_true[..., 0]  # [batch, N, N]
-        baseline_corr = y_true[..., 1]  # [batch, N, N]
-        affected_mask = tf.cast(y_true[..., 2], tf.float32)  # [batch, N, N] - 1 if pair involves affected company
+        actual_corr = y_true[..., 0]
+        baseline_corr = y_true[..., 1]
+        affected_mask = tf.cast(y_true[..., 2], tf.float32)
         
         mu = y_pred[..., 0]  # [batch, N, N]
-        log_var = y_pred[..., 1]  # [batch, N, N]
-        log_var = tf.clip_by_value(log_var, -6.0, 10.0) # to avoid underflow and overflow of exp(), which leads to an explosion of loss
+        raw_logvar = y_pred[..., 1]  # [batch, N, N]
+        raw_logvar = tf.clip_by_value(raw_logvar, -6.0, 10.0) # to avoid underflow and overflow of exp(), which leads to an explosion of loss
         
-        # Ensure numerical stability
-        var = tf.exp(log_var) + self.min_sigma
-        
-        # Standard NLL
-        nll = 0.5 * (tf.square(actual_corr - mu) / var + log_var)
-        
-        # WEIGHT 1: Affected company involvement
-        # affected_mask is pre-computed: 1.0 if either i or j is in affected_companies, else 0.0
+        # stable variance construction: softplus ensures positivity, min_sigma avoids division by zero
+        var = tf.nn.softplus(raw_logvar) + self.min_sigma
+        # standard NLL per element
+        sq_err = tf.square(actual_corr - mu)
+
+        # weights per element
         affected_weights = 1.0 + (self.affected_weight - 1.0) * affected_mask
-        # Result: affected pairs get self.affected_weight (e.g., 3.0), others get 1.0
+        actual_change = tf.abs(actual_corr - baseline_corr)        
+        total_weights = affected_weights * (1.0 + self.magnitude_weight * actual_change)
+
+        # normalize weights so average weight == 1 to preserve loss scale
+        total_weights_norm = total_weights / (tf.reduce_mean(total_weights) + 1e-12)
         
-        # WEIGHT 2: Magnitude of actual change
-        actual_change = tf.abs(actual_corr - baseline_corr)
-        magnitude_weights = 1.0 + self.magnitude_weight * actual_change
+        # compute weighted mean properly (sum(weights * loss) / sum(weights))
+        weighted_nll = tf.reduce_mean(0.5 * (sq_err / var + tf.math.log(var + 1e-12)) * total_weights_norm)
         
-        # Combined weights
-        total_weights = affected_weights * magnitude_weights
-        # Weighted NLL
-        weighted_nll = nll * total_weights
-        return tf.reduce_mean(weighted_nll)
+        # small penalty to prevent variances collapsing to extremely small values
+        if self.variance_penalty_weight > 0.0:
+            shortfall = tf.nn.relu(self.variance_floor - var)
+            var_penalty = self.variance_penalty_weight * tf.reduce_mean(shortfall)
+        else:
+            var_penalty = 0.0
+        return weighted_nll + var_penalty
 
 class CalibrationMetric(metrics.Metric):
     """
     Measures how well the predicted uncertainty (σ) matches actual errors
     Good calibration: High σ → High error, Low σ → Low error
     """
-    def __init__(self, num_bins=10, **kwargs):
+    def __init__(self, min_sigma, num_bins=10, **kwargs):
         super().__init__(**kwargs)
+        self.min_sigma = float(min_sigma)
         self.num_bins = num_bins
         self.bin_errors = self.add_weight(
             name='bin_errors', 
@@ -149,8 +177,8 @@ class CalibrationMetric(metrics.Metric):
         # Extract actual correlations and predictions (mean, log variance)
         actual_corr = y_true[..., 0]
         mu = y_pred[..., 0]
-        log_var = y_pred[..., 1]
-        sigma = tf.sqrt(tf.exp(log_var) + 1e-6)  # Calculate standard deviation
+        raw_logvar = y_pred[..., 1]
+        sigma = tf.sqrt(tf.nn.softplus(raw_logvar) + self.min_sigma)  # Calculate standard deviation
         
         # Calculate the absolute errors between actual and predicted values
         errors = tf.abs(actual_corr - mu)
@@ -186,6 +214,60 @@ class CalibrationMetric(metrics.Metric):
     def reset_state(self):
         self.bin_errors.assign(tf.zeros_like(self.bin_errors))
         self.bin_counts.assign(tf.zeros_like(self.bin_counts))
+
+class TemperatureGatedDense(layers.Layer):
+    """
+    Dense → temperature-scaled sigmoid gate with optional L1 activity regularization.
+    Enables learnable control over how strongly each feature is passed through.
+    """
+    def __init__(self, units, initial_temperature=1.0, activity_l1=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.initial_temperature = initial_temperature
+        self.activity_l1 = activity_l1
+
+        self.dense = layers.Dense(
+            units,
+            activation=None,
+            kernel_regularizer=regularizers.l1_l2(1e-6),
+            name="gate_dense"
+        )
+
+    def build(self, input_shape):
+        # Learnable temperature parameter
+        self.temperature = self.add_weight(
+            name='temperature',
+            shape=(),
+            initializer=initializers.Constant(self.initial_temperature),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # Dense → logits
+        logits = self.dense(inputs)  # [batch, seq_len, units]
+
+        # Temperature (softplus ensures positivity)
+        temp_pos = tf.nn.softplus(self.temperature)
+
+        # Final gate
+        gate = tf.sigmoid(logits * temp_pos)
+
+        # Optional activity regularization on gate activations
+        if self.activity_l1 > 0.0:
+            reg = tf.reduce_mean(tf.abs(gate)) * self.activity_l1
+            self.add_loss(reg)
+
+        return gate
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+            "initial_temperature": self.initial_temperature,
+            "activity_l1": self.activity_l1,
+        })
+        return config
 
 class OptimizedAttentionLayer(layers.Layer):
     def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
@@ -226,6 +308,95 @@ class OptimizedAttentionLayer(layers.Layer):
         attn_out = attn_out * self.temperature  # Temperature scaled attention
         return self.layer_norm(query + self.dropout(attn_out, training=training)) # Residual connection
 
+class PairwiseAdaptiveGate(layers.Layer):
+    """
+    Learns how much to trust the baseline correlation vs. predicted changes.
+    Includes initialization for stability and clamping to prevent baseline collapse.
+    """
+    def __init__(self, 
+                 num_companies, 
+                 alpha_min=0.15,     # Minimum trust in baseline (ChatGPT idea)
+                 hidden_units=64, 
+                 activity_l1=1e-4, 
+                 entropy_reg=1e-4,   # Encourage decisive gating (ChatGPT idea)
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.num_companies = num_companies
+        self.alpha_min = alpha_min
+        self.activity_l1 = activity_l1
+        self.entropy_reg = entropy_reg
+        self.hidden_units = hidden_units
+
+        # Hidden projection
+        self.gate_hidden = layers.Dense(
+            hidden_units,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
+            name="gate_hidden"
+        )
+
+        # Logits output
+        self.gate_logits = layers.Dense(
+            1,
+            activation=None, # We apply sigmoid manually later
+            kernel_regularizer=regularizers.l2(1e-6),
+            bias_initializer='ones', # Start with high trust in baseline!
+            name="gate_logits"
+        )
+
+        self.reshape = layers.Reshape((num_companies, num_companies), name="gate_reshape")
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_companies": self.num_companies,
+            "alpha_min": self.alpha_min,
+            "hidden_units": self.hidden_units,
+            "activity_l1": self.activity_l1,
+            "entropy_reg": self.entropy_reg
+        })
+        return config
+
+    def call(self, inputs, baseline_corr):
+        # inputs: merged_features [batch, N, N, features]
+        
+        # 1. Hidden layer
+        gate_hidden = self.gate_hidden(inputs) # [batch, N, N, 64]
+
+        # 2. Logits -> Sigmoid
+        # Mivel a bias=1, ez kezdetben sigmoid(1) ~= 0.73 lesz
+        raw_alpha = tf.sigmoid(self.gate_logits(gate_hidden)) # [batch, N, N, 1]
+        
+        # 3. Reshape
+        alpha = self.reshape(raw_alpha) # [batch, N, N]
+
+        # 4. Clamping (ChatGPT okos ötlete)
+        # Biztosítjuk, hogy alpha sose menjen alpha_min alá
+        # Képlet: alpha_skálázott = alpha * (1 - min) + min
+        alpha = alpha * (1.0 - self.alpha_min) + self.alpha_min
+
+        # 5. Sparsity Regularization (Ne akarjon mindenhol eltérni)
+        if self.activity_l1 > 0.0:
+            # Büntetjük, ha az alpha csökken (tehát ha eltérünk a baseline-tól)
+            # Minél kisebb az alpha (távolodunk az 1-től), annál nagyobb a büntetés?
+            # Nem, itt az aktivitást büntetjük.
+            # Helyesebb inkább a (1-alpha)-t büntetni, ha a baseline-hoz ragaszkodást akarjuk.
+            # De maradjunk az egyszerű activity regnél a gate neuronokon.
+            self.add_loss(self.activity_l1 * tf.reduce_mean(tf.abs(raw_alpha)))
+
+        # 6. Entropy Regularization (Legyen határozott)
+        if self.entropy_reg > 0.0:
+            # Shannon entrópia minimalizálása: p*log(p)
+            p = alpha
+            # Epszilon a 0 logaritmus elkerülésére
+            entropy = - (p * tf.math.log(p + 1e-8) + (1 - p) * tf.math.log(1 - p + 1e-8))
+            self.add_loss(self.entropy_reg * tf.reduce_mean(entropy))
+
+        # 7. Gated Baseline
+        gated_baseline = layers.Multiply()([baseline_corr, alpha])
+
+        return gated_baseline
+
 class AttentionBasedNewsFactorModel:
     """
     Enhanced multi-task learning model with:
@@ -234,7 +405,7 @@ class AttentionBasedNewsFactorModel:
     3. Weighted loss focusing on important pairs
     """
 
-    def __init__(self, tokenizer, bert_model, num_companies, max_keywords=128, keyword_dim=256, company_dim=128, latent_dim=256):
+    def __init__(self, tokenizer, bert_model, num_companies, min_sigma=8e-4, max_keywords=128, keyword_dim=256, company_dim=128, latent_dim=256):
         self.tokenizer = tokenizer
         self.bert_model = bert_model
         self.num_companies = num_companies
@@ -242,6 +413,7 @@ class AttentionBasedNewsFactorModel:
         self.keyword_dim = keyword_dim
         self.company_dim = company_dim
         self.latent_dim = latent_dim
+        self.min_sigma = min_sigma
 
         # Simple BERT embedding cache (hash-based)
         self._bert_cache = {}
@@ -255,12 +427,12 @@ class AttentionBasedNewsFactorModel:
         optimizer = optimizers.AdamW(
             learning_rate=optimizers.schedules.CosineDecayRestarts(
                 initial_learning_rate=1e-4,
-                first_decay_steps=1000,
+                first_decay_steps=2000,
                 t_mul=2.0,
-                m_mul=0.9,
+                m_mul=0.85,
                 alpha=0.1
             ),
-            weight_decay=4e-5,
+            weight_decay=1e-4,
             clipnorm=1.0
         )
         
@@ -268,19 +440,22 @@ class AttentionBasedNewsFactorModel:
             optimizer=optimizer,
             loss={
                 'correlation_changes_probabilistic': WeightedNegativeLogLikelihoodLoss(
-                    affected_weight=3.0,  # 3x weight for pairs with affected companies
-                    magnitude_weight=2.0  # +2x weight per unit of actual change
+                    min_sigma=self.min_sigma,
+                    affected_weight=3.3, # weight for pairs with affected companies
+                    magnitude_weight=1.2, # weight per unit of actual change
+                    variance_penalty_weight=2e-4,
+                    variance_floor=8e-3
                 ),
                 'price_deviations': losses.Huber(delta=1.0),
                 'news_reconstruction': 'mae'
             },
             loss_weights={
-                'correlation_changes_probabilistic': 3.5,
+                'correlation_changes_probabilistic': 3.0,
                 'price_deviations': 0.5,
                 'news_reconstruction': 0.5
             },
             metrics={
-                'correlation_changes_probabilistic': [CalibrationMetric(), DirectionalAccuracy()],
+                'correlation_changes_probabilistic': [CalibrationMetric(min_sigma=self.min_sigma), HighConfidenceDirectionalAccuracy(sigma_threshold=0.85, min_sigma=self.min_sigma)],
                 'price_deviations': ['mae', 'mse'],
                 'news_reconstruction': ['mae']
             }
@@ -359,37 +534,25 @@ class AttentionBasedNewsFactorModel:
                 name='local_conv_small'
             )(processed_keywords)  # [batch, seq_len, local_filters]
 
-            # 4.b Gate over conv features
-            # We add a learnable temperature scalar to the gate input and use a sigmoid.
-            # The temperature is implemented as a small Dense with linear output and non-negative constraint below.
-            gate_logits = layers.Dense(
-                local_filters,
-                activation=None,
-                kernel_regularizer=regularizers.l1_l2(1e-6),
-                name='local_gate_logits'
-            )(processed_keywords)  # [batch, seq_len, local_filters]
-
-            # Temperature (simple scalar) applied through softplus for positivity
-            temp = tf.Variable(1.0, trainable=True, dtype=tf.float32, name="gate_temperature")
-            temp_pos = tf.nn.softplus(temp)
-
-            # Apply temperature scaling
-            local_gate = layers.Activation(lambda x: tf.sigmoid(x * temp_pos), name='local_gate')(gate_logits)
-
-            # L1 activity regularization ON THE GATE
-            local_gate = layers.ActivityRegularization(l1=1e-3, name='local_gate_activity')(local_gate)
+            # 4.b  Adaptive gating over the local features with L1 activity regularization
+            local_gate = TemperatureGatedDense(
+                units=local_filters,
+                initial_temperature=1.0,
+                activity_l1=1e-3,
+                name="local_gate"
+            )(processed_keywords)
 
             # 4.c Elementwise multiply conv features with gate
             gated_local = layers.Multiply(name='gated_local')([local_conv, local_gate])  # [batch, seq_len, local_filters]
 
-            # 4.d Top-k mean pooling implemented inside Lambda (no symbolic Python ops)
+            # 4.d Top-k mean pooling
             def top_k_mean(x):
                 # x shape: [batch, seq_len, filters]
                 # transpose so we perform top-k over seq_len for each filter
                 x_t = tf.transpose(x, [0, 2, 1])  # [batch, filters, seq_len]
                 values, _ = tf.nn.top_k(x_t, k=top_k)  # [batch, filters, k]
                 return tf.reduce_mean(values, axis=-1)  # [batch, filters]
-
+            
             local_edge = layers.Lambda(top_k_mean, name='local_topk')(gated_local)
 
             # 4.e Small dropout on local_edge to further reduce overfitting
@@ -405,10 +568,8 @@ class AttentionBasedNewsFactorModel:
 
         else:
             # Disabled mode (ablation)
-            local_edge_proj = layers.Lambda(
-                lambda x: tf.zeros([tf.shape(x)[0], self.latent_dim], dtype=tf.float32),
-                name='local_edge_disabled'
-            )(keyword_input)
+            local_edge_proj = tf.zeros([tf.shape(keyword_input)[0], self.latent_dim], dtype=tf.float32)
+        
         local_edge_proj = layers.ActivityRegularization(l2=1e-4)(local_edge_proj)
 
         # -----------------------------
@@ -427,7 +588,7 @@ class AttentionBasedNewsFactorModel:
 
         # Use LayerNorm (not BatchNorm) and small Dropout for stability without erasing edges
         shared_news_rep = layers.LayerNormalization(name='shared_news_layernorm')(shared_news_rep)
-        shared_news_rep = layers.Dropout(0.31, name='shared_news_dropout')(shared_news_rep)
+        shared_news_rep = layers.Dropout(0.36, name='shared_news_dropout')(shared_news_rep)
 
         # -----------------------------
         # 6. Company embeddings (for pairwise features only)
@@ -443,22 +604,18 @@ class AttentionBasedNewsFactorModel:
         # Get embeddings for all companies repeating across batch dimension
         batch_size = tf.shape(keyword_input)[0]
         all_company_indices = tf.range(self.num_companies, dtype=tf.int32)
-        all_company_indices = tf.expand_dims(all_company_indices, 0)
-        all_company_indices = tf.tile(all_company_indices, [batch_size, 1]) # [batch, N]
+        all_company_indices = tf.tile(tf.expand_dims(all_company_indices, 0), [batch_size, 1]) # [batch, N]
         all_company_embeddings = company_embedding_layer(all_company_indices)  # [batch, N, company_dim]
 
         # Create pairwise features: for each pair (i,j), concatenate [company_i, company_j, news]
         # company_i: [batch, N, 1, company_dim] -> tile to [batch, N, N, company_dim]
-        company_i = layers.Lambda(lambda x: tf.expand_dims(x, 2), name='company_i_expand')(all_company_embeddings)
-        company_i = layers.Lambda(lambda x: tf.tile(x, [1, 1, self.num_companies, 1]), name='company_i_tile')(company_i)
+        company_i = tf.tile(tf.expand_dims(all_company_embeddings, 2), [1, 1, self.num_companies, 1])
 
         # company_j: [batch, 1, N, company_dim] -> tile to [batch, N, N, company_dim]
-        company_j = layers.Lambda(lambda x: tf.expand_dims(x, 1), name='company_j_expand')(all_company_embeddings)
-        company_j = layers.Lambda(lambda x: tf.tile(x, [1, self.num_companies, 1, 1]), name='company_j_tile')(company_j)
+        company_j = tf.tile(tf.expand_dims(all_company_embeddings, 1), [1, self.num_companies, 1, 1])
 
         # shared_news_rep: [batch, latent] -> expand to [batch, N, N, latent]
-        news_expanded = layers.Lambda(lambda x: tf.expand_dims(tf.expand_dims(x, 1), 1), name='news_expand')(shared_news_rep)  # [batch,1,1,latent]
-        news_for_pairs = layers.Lambda(lambda x: tf.tile(x, [1, self.num_companies, self.num_companies, 1]), name='news_tile_for_pairs')(news_expanded) # [batch, N, N, latent]
+        news_for_pairs = tf.tile(tf.expand_dims(tf.expand_dims(shared_news_rep, 1), 1), [1, self.num_companies, self.num_companies, 1]) # [batch, N, N, latent]
 
         # Concatenate company_i, company_j, news_for_pairs along the last axis
         pairwise_features = layers.Concatenate(axis=-1, name='pairwise_concat')([company_i, company_j, news_for_pairs]) # shape: [batch, N, N, 2*company_dim + latent]
@@ -467,7 +624,7 @@ class AttentionBasedNewsFactorModel:
         # 7. Probabilistic residual head: Predict correlation CHANGE (delta)
         # -----------------------------
         # Flatten baseline correlation into a channel for concatenation
-        baseline_flat = layers.Reshape((self.num_companies, self.num_companies, 1), name='baseline_reshape')(baseline_correlation_input)
+        baseline_flat = tf.expand_dims(baseline_correlation_input, -1)  # [batch, N, N, 1]
 
         # Merge pairwise features with baseline correlation
         merged_features = layers.Concatenate(axis=-1, name='merged_features_with_baseline')([
@@ -482,24 +639,30 @@ class AttentionBasedNewsFactorModel:
             kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
             name='delta_hidden_shared'
         )(merged_features)
-        delta_hidden = layers.Dropout(0.4, name='delta_hidden_dropout')(delta_hidden)
+        delta_hidden = layers.Dropout(0.45, name='delta_hidden_dropout')(delta_hidden)
         # TWO SEPARATE DENSE LAYERS for different predictions for Mean (μ) and Log-Variance (log σ²)
 
         # μ: expected correlation change
-        delta_mu_raw = layers.Dense(1, activation='linear', name='correlation_delta_mu')(delta_hidden) # [batch, N, N, 1]
-        delta_mu = layers.Reshape((self.num_companies, self.num_companies), name='delta_mu_reshaped')(delta_mu_raw) # [batch, N, N]
+        delta_mu = tf.squeeze(layers.Dense(1, activation='linear', name='correlation_delta_mu')(delta_hidden), axis=-1) # [batch, N, N]
 
         # log(σ²): aleatoric uncertainty
         delta_log_var_raw = layers.Dense(1, activation='linear', name='correlation_delta_log_var')(delta_hidden)  # [batch, N, N, 1]
-        delta_log_var_clipped = layers.Lambda(lambda x: tf.clip_by_value(x, -1.1, 5.9), name='delta_log_var_clipped')(delta_log_var_raw)
-        delta_log_var = layers.Reshape((self.num_companies, self.num_companies), name='delta_log_var_reshaped')(delta_log_var_clipped)  # [batch, N, N]
+        delta_log_var = tf.squeeze(tf.clip_by_value(delta_log_var_raw, -1.1, 5.9), axis=-1)  # [batch, N, N]
 
         # Ensure symmetry for μ and log_var (average with transpose)
-        delta_mu_symmetric = layers.Lambda(lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])), name='correlation_delta_mu_symmetric')(delta_mu)
-        delta_log_var_symmetric = layers.Lambda(lambda m: 0.5 * (m + tf.transpose(m, perm=[0, 2, 1])), name='correlation_delta_log_var_symmetric')(delta_log_var)
+        delta_mu_symmetric = 0.5 * (delta_mu + tf.transpose(delta_mu, perm=[0, 2, 1]))
+        delta_log_var_symmetric = 0.5 * (delta_log_var + tf.transpose(delta_log_var, perm=[0, 2, 1]))
 
-        # Residual connection: baseline + μ_delta -> predicted mean correlation
-        correlation_mean = layers.Add(name='correlation_mean_prediction')([baseline_correlation_input, delta_mu_symmetric])
+        # GATED RESIDUAL: Learn how much to trust baseline vs. delta
+        # Gate predicts alpha per pair: 1=full baseline, 0=full delta
+        pairwise_gate = PairwiseAdaptiveGate(
+            num_companies=self.num_companies,
+            name='pairwise_adaptive_gate'
+        )
+        gated_baseline = pairwise_gate(merged_features, baseline_correlation_input)
+        
+        # Gated residual: α*baseline + delta
+        correlation_mean = layers.Add(name='correlation_mean_prediction')([gated_baseline, delta_mu_symmetric])
         # Stack mean and log-variance for downstream probabilistic loss
         correlation_changes_prob = layers.Lambda(lambda tensors: tf.stack(tensors, axis=-1), name='correlation_changes_probabilistic')([correlation_mean, delta_log_var_symmetric]) # [batch, N, N, 2]
 
@@ -524,7 +687,7 @@ class AttentionBasedNewsFactorModel:
             name='NewsCorrelationProbabilisticResidualModel'
         )
 
-    def train(self, training_data, validation_data=None, epochs=100, batch_size=32):
+    def train(self, training_data, validation_data=None, epochs=60, batch_size=16):
         """Train the probabilistic residual correlation model"""
         
         # Create output directory for models
@@ -600,15 +763,17 @@ class AttentionBasedNewsFactorModel:
                 batch_size=batch_size,
                 callbacks=[
                     callbacks.EarlyStopping(
-                        monitor='val_loss' if validation_data else 'loss',
-                        patience=15, 
+                        monitor='val_correlation_changes_probabilistic_calibration_metric' if validation_data else 'correlation_changes_probabilistic_calibration_metric',
+                        mode='min',
+                        patience=40,  # Increased patience for calibration
+                        min_delta=1e-3,
                         restore_best_weights=True
                     ),
                     callbacks.ReduceLROnPlateau(
                         monitor='val_loss' if validation_data else 'loss', 
                         factor=0.5, 
                         patience=8, 
-                        min_lr=1e-6
+                        min_lr=9e-7
                     ),
                     MLflowCallback()
                 ],
@@ -638,7 +803,7 @@ class AttentionBasedNewsFactorModel:
                 mlflow.log_metric('best_train_loss', min(history.history['loss']))     
         return history
 
-    def predict_with_uncertainty(self, text, baseline_correlation, n_samples: int = 10):
+    def predict_with_uncertainty(self, text, baseline_correlation, n_samples: int = 30):
         """
         Monte Carlo Dropout uncertainty + reconstruction-based confidence.
 
@@ -646,10 +811,12 @@ class AttentionBasedNewsFactorModel:
             keywords: Tokenized keywords
             baseline_correlation: Baseline correlation matrix
             news_target_embedding: Ground truth BERT embedding of the news (for reconstruction error)
-            n_samples: Number of MC Dropout samples (default: 10)
+            n_samples: Number of MC Dropout samples (default: 30)
 
         Returns:
-            Dict
+            A dictionary containing the average MC Dropout prediction (mc_mu),
+            the prediction uncertainty (mc_logvar), the estimated price deviations,
+            and the reconstruction error of the news embedding.
         """
 
         # ----------------------------
@@ -689,38 +856,18 @@ class AttentionBasedNewsFactorModel:
         mc_logvar = np.stack(mc_logvar, axis=0)
 
         # ----------------------------
-        # 3) Uncertainty decomposition
-        # ----------------------------
-        epistemic_var = np.var(mc_mu, axis=0) # Epistemic uncertainty: variance across MC samples
-        aleatoric_var = np.mean(np.exp(mc_logvar) + 1e-6, axis=0) # Aleatoric uncertainty: average of predicted variances
-        sigma = np.sqrt(epistemic_var + aleatoric_var)
-
-        # ----------------------------
-        # 4) Reconstruction error (using predict for final deterministic output)
+        # 3) Reconstruction error (using predict for final deterministic output)
         # ----------------------------
         final_pred = self.model.predict([keywords, baseline_correlation], verbose=0)
         recon_prediction = final_pred[2]  # shape [1, latent_dim]
         min_len = min(recon_prediction.shape[-1], news_target_embedding.shape[-1])
         recon_error = np.mean(np.abs(news_target_embedding[..., :min_len] - recon_prediction[..., :min_len]))
 
-        # ----------------------------
-        # 5) Confidence scores
-        # ----------------------------
-        epistemic_conf = 1.0 / (1.0 + np.sqrt(epistemic_var).mean())
-        aleatoric_conf = 1.0 / (1.0 + np.sqrt(aleatoric_var).mean())
-        unc_conf = 1.0 / (1.0 + sigma.mean())
-        recon_conf = np.exp(-recon_error)
-
         return {
-            "mean": np.mean(mc_mu, axis=0),
-            "std": sigma,
-            "price_deviations": final_pred[1],
-            "reconstruction_error": recon_error,
-            "epistemic_conf": epistemic_conf,
-            "aleatoric_conf": aleatoric_conf,
-            "uncertainty_conf": unc_conf,
-            "recon_conf": recon_conf,
-            "total_conf": recon_conf * unc_conf
+            "mc_mu": mc_mu,
+            "mc_logvar": mc_logvar,
+            "price_deviations": final_pred[1][0],
+            "recon_error": recon_error
         }
     
     def prepare_keyword_sequence(self, text: str) -> np.ndarray:

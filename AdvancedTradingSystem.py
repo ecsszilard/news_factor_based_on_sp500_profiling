@@ -175,9 +175,6 @@ class AdvancedTradingSystem:
                 comp for comp in self.data_processor.companies 
                 if comp.lower() in news_text.lower()
             ]
-        
-        # Detect news scope
-        news_scope = self._classify_news_scope(news_text, affected_companies)
 
         # Make probabilistic predictions
         predictions = self.news_factor_model.predict_with_uncertainty(
@@ -187,15 +184,23 @@ class AdvancedTradingSystem:
         )
         
         # Extract probabilistic predictions
-        mu_z = predictions['mean'][0]  # [N, N] - μ in Fisher-z space
-        sigma_z = predictions['std'][0]    # [N, N] - σ (uncertainty)
-        total_confidence = predictions['total_conf']
+        mc_mu = predictions['mc_mu']
+        mc_logvar = predictions['mc_logvar']
+        recon_error = float(predictions['recon_error'])     
+
+        # Calculate confidence scores
+        epistemic_var = np.var(mc_mu, axis=0) # Epistemic uncertainty: variance across MC samples
+        aleatoric_var = np.mean(np.exp(mc_logvar) + 1e-6, axis=0) # Aleatoric uncertainty: average of predicted variances
+        sigma = np.sqrt(epistemic_var + aleatoric_var) # [N, N] - σ (uncertainty) 
+        recon_conf = np.exp(-recon_error)
+        unc_conf = 1.0 / (1.0 + sigma.mean())
+        total_conf = recon_conf * unc_conf
 
         # Convert back to correlation space
-        predicted_corr = self.data_processor.inverse_fisher_z_transform(mu_z)
+        mu_z = np.mean(mc_mu, axis=0)[0] # [N, N] - μ in Fisher-z space
         baseline_corr = self.data_processor.inverse_fisher_z_transform(self.data_processor.baseline_z)
+        predicted_corr = self.data_processor.inverse_fisher_z_transform(mu_z)
         delta_corr = predicted_corr - baseline_corr
-        sigma_corr = self.data_processor.fisher_z_sigma_to_correlation_sigma(mu_z, sigma_z)
         
         results = {}
         for company in target_companies:
@@ -207,7 +212,7 @@ class AdvancedTradingSystem:
             for i, other_company in enumerate(self.data_processor.companies):
                 if i != company_idx_in_list:
                     change = delta_corr[company_idx_in_list, i]
-                    uncertainty = sigma_z[company_idx_in_list, i]
+                    uncertainty = sigma[0][company_idx_in_list, i]
                     
                     # Only report if change is significant AND uncertainty is low
                     if abs(change) > correlation_threshold and uncertainty < self.uncertainty_threshold:
@@ -223,7 +228,7 @@ class AdvancedTradingSystem:
             # Calculate overall impact metrics
             max_change = float(np.max(np.abs(delta_corr[company_idx_in_list, :])))
             mean_change = float(np.mean(delta_corr[company_idx_in_list, :]))
-            avg_uncertainty = float(np.mean(sigma_z[company_idx_in_list, :]))
+            avg_uncertainty = float(np.mean(sigma[0][company_idx_in_list, :]))
             
             # Similar companies (based on predicted correlations)
             similar_companies = []
@@ -236,26 +241,28 @@ class AdvancedTradingSystem:
             
             # Determine if this company should be traded based on uncertainty
             tradeable = (
-                total_confidence > self.confidence_threshold and
+                total_conf > self.confidence_threshold and
                 avg_uncertainty < self.uncertainty_threshold and
                 max_change > correlation_threshold
             )
             
             results[company] = {
-                'predicted_corr': predicted_corr,
-                'uncertainty_matrix': sigma_z,
+                'mu_z': mu_z,
+                'sigma_z': sigma[0],
                 'baseline_corr': baseline_corr,
+                'predicted_corr': predicted_corr,
                 'delta_corr': delta_corr,
-                'sigma_corr' : sigma_corr,
-                'reconstruction_error': float(predictions['reconstruction_error']),
-                "epistemic_confidence": float(predictions['epistemic_conf']),
-                "aleatoric_confidence": float(predictions['aleatoric_conf']),
-                "uncertainty_confidence": float(predictions['uncertainty_conf']),
-                "recon_confidence": float(predictions['recon_conf']),
-                'total_confidence': total_confidence,
-                'news_scope': news_scope,
+                'sigma_corr' : self.data_processor.fisher_z_sigma_to_correlation_sigma(mu_z, sigma[0]),
+                'reconstruction_error': recon_error,
+                "epistemic_confidence": 1.0 / (1.0 + np.sqrt(epistemic_var).mean()),
+                "aleatoric_confidence": 1.0 / (1.0 + np.sqrt(aleatoric_var).mean()),
+                "uncertainty_confidence": unc_conf,
+                "recon_confidence": recon_conf,
+                'total_confidence': total_conf,
+                'news_scope': self._classify_news_scope(news_text, affected_companies),
                 'affected_companies': affected_companies,
                 'tradeable': tradeable,
+                'price_deviations': predictions['price_deviations'],
                 'correlation_impact': {
                     'max_change': max_change,
                     'mean_change': mean_change,
@@ -264,7 +271,7 @@ class AdvancedTradingSystem:
                     'baseline_avg': float(np.mean(baseline_corr[company_idx_in_list, :])),
                     'predicted_avg': float(np.mean(predicted_corr[company_idx_in_list, :]))
                 },
-                'price_impact': float(predictions['price_deviations'][0][company_idx_in_list]),
+                'price_impact': float(predictions['price_deviations'][company_idx_in_list]),
                 'similar_companies': similar_companies[:5]
             }
         return results
@@ -333,7 +340,7 @@ class AdvancedTradingSystem:
                 self.max_position_size * 
                 strength * 
                 total_confidence *
-                uncertainty_adjustment  # NEW: Inverse of uncertainty
+                uncertainty_adjustment  # Inverse of uncertainty
             )
             
             signal = {
@@ -341,7 +348,7 @@ class AdvancedTradingSystem:
                 'type': signal_type,
                 'strength': strength,
                 'total_confidence': total_confidence,
-                'uncertainty': avg_uncertainty,
+                'avg_uncertainty': avg_uncertainty,
                 'uncertainty_adjustment': uncertainty_adjustment,
                 'position_size': position_size,
                 'volatility_impact': max_correlation_change,
@@ -359,7 +366,7 @@ class AdvancedTradingSystem:
         
         # Sort by risk-adjusted score
         signals.sort(
-            key=lambda x: (x['strength'] * x['total_confidence']) / (x['uncertainty'] + 0.1), 
+            key=lambda x: (x['strength'] * x['total_confidence']) / (x['avg_uncertainty'] + 0.1), 
             reverse=True
         )
         return signals
@@ -379,7 +386,7 @@ class AdvancedTradingSystem:
                 'type': signal['type'],
                 'size': signal['position_size'],
                 'total_confidence': signal['total_confidence'],
-                'uncertainty': signal['uncertainty'],
+                'avg_uncertainty': signal['avg_uncertainty'],
                 'uncertainty_adjustment': signal.get('uncertainty_adjustment', 1.0),
                 'correlation_adjustment': signal.get('correlation_adjustment', 1.0),
                 'correlation_impact': signal.get('correlation_impact', {}),
@@ -406,51 +413,7 @@ class AdvancedTradingSystem:
                 signal["total_confidence"], signal["uncertainty"],
                 signal.get("correlation_impact", {}).get("max_change", 0.0),
             )
-        
         return executed_trades
-    
-    def save_model_and_data(self, path='probabilistic_correlation_models'):
-        """Save the probabilistic correlation model and associated data"""
-        if not os.path.exists(path):
-            os.makedirs(path)
-        
-        self.news_factor_model.model.save_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
-        
-        # Save trading data including correlation matrix
-        with open(os.path.join(path, 'trading_data.pkl'), 'wb') as f:
-            pickle.dump({
-                'positions': self.positions,
-                'portfolio_value': self.portfolio_value,
-                'trade_history': self.trade_history,
-                'confidence_threshold': self.confidence_threshold,
-                'uncertainty_threshold': self.uncertainty_threshold
-            }, f)
-        
-        logger.info("Probabilistic models and data saved: %s", path)
-        
-    def load_model_and_data(self, path='probabilistic_correlation_models'):
-        """Load the probabilistic correlation model and associated data"""
-
-        if not self.news_factor_model.model:
-            self.news_factor_model.build_model()
-
-        try:
-            self.news_factor_model.model.load_weights(os.path.join(path, 'probabilistic_correlation_weights.weights.h5'))
-
-            with open(os.path.join(path, 'trading_data.pkl'), 'rb') as f:
-                trading_data = pickle.load(f)
-                self.positions = trading_data['positions']
-                self.portfolio_value = trading_data['portfolio_value']
-                self.trade_history = trading_data['trade_history']
-                self.confidence_threshold = trading_data.get('confidence_threshold', 0.6)
-                self.uncertainty_threshold = trading_data.get('uncertainty_threshold', 0.4)
-            
-            logger.info("Probabilistic models and data loaded: %s", path)
-            return True
-            
-        except Exception as e:
-            logger.error("Error during loading: %s", e)
-            return False
     
     def get_portfolio_diversification_metrics(self):
         """Calculate portfolio diversification metrics using correlation matrix"""

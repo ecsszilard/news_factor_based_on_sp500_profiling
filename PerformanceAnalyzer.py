@@ -27,7 +27,6 @@ class PerformanceAnalyzer:
     def __init__(self, trading_system):
         """Initialize the performance analyzer"""
         self.trading_system = trading_system
-        self.data_processor = trading_system.data_processor
         self.news_factor_model = trading_system.data_processor.news_factor_model
         logger.info("PerformanceAnalyzer initialized with clustering capabilities")
 
@@ -539,18 +538,19 @@ class PerformanceAnalyzer:
         
         return fig
 
-    def visualize_uncertainty_predictions(self, analysis, companies, news_text):
+    def visualize_uncertainty_predictions(self, analysis, news_text):
         """
         Visualize probabilistic predictions with uncertainty bands
         
         Args:
             analysis: Dict with confidence metrics from predict_news_impact
-            companies: List of company names
             news_text: News text for title
         """
+
+        companies = self.trading_system.data_processor.companies
         predicted_corr = analysis['predicted_corr']
-        sigma_corr = analysis['sigma_corr']
         delta_corr = analysis['delta_corr']
+        sigma_corr = analysis['sigma_corr']
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         fig.suptitle(f'Probabilistic Prediction Analysis\nNews: "{news_text[:80]}..."', fontsize=14, fontweight='bold')
@@ -619,10 +619,10 @@ class PerformanceAnalyzer:
             ax4.text(bar.get_x() + bar.get_width()/2., height + 0.02, f'{val:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
         
         # Statistics
-        uncertainty_matrix = analysis['uncertainty_matrix']
-        stats_text = f"Avg σ_total: {np.mean(uncertainty_matrix):.4f}\n"
-        stats_text += f"Max σ: {np.max(uncertainty_matrix):.4f}\n"
-        stats_text += f"High uncertainty pairs: {np.sum(uncertainty_matrix > 0.3)}/{len(companies)**2}"
+        sigma_z = analysis['sigma_z']
+        stats_text = f"Avg σ_total: {np.mean(sigma_z):.4f}\n"
+        stats_text += f"Max σ: {np.max(sigma_z):.4f}\n"
+        stats_text += f"High uncertainty pairs: {np.sum(sigma_z > 0.3)}/{len(companies)**2}"
         ax4.text(0.02, 0.98, stats_text, transform=ax4.transAxes, fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
@@ -644,8 +644,8 @@ class PerformanceAnalyzer:
         axes[0, 0].grid(True, alpha=0.3)
 
         # 2. Directional Accuracy
-        train_acc = history.history['correlation_changes_probabilistic_directional_accuracy']
-        val_acc = history.history['val_correlation_changes_probabilistic_directional_accuracy']
+        train_acc = history.history['correlation_changes_probabilistic_high_confidence_directional_accuracy']
+        val_acc = history.history['val_correlation_changes_probabilistic_high_confidence_directional_accuracy']
         axes[0, 1].plot(train_acc, label='Train', linewidth=2)
         axes[0, 1].plot(val_acc, label='Validation', linewidth=2)
         axes[0, 1].set_xlabel('Epoch')

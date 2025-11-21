@@ -54,8 +54,8 @@ class Utils:
     
     def create_hybrid_data(self, 
                           num_companies: int = 20,
-                          num_news: int = 600,
-                          days: int = 350,
+                          num_news: int = 1000,
+                          days: int = 500,
                           train_ratio: float = 0.7):
         """
         Hibrid adatgenerálás: realisztikus ár- és hírgenerálás fejlett szimulációval
@@ -75,7 +75,7 @@ class Utils:
         
         # 2. Korrelációs mátrix C és kovarianciamátrix Σ építése
         correlation_matrix = self._build_correlation_matrix(company_symbols, sector_map)
-        volatilities = np.random.uniform(0.015, 0.035, size=num_companies)
+        volatilities = np.random.uniform(0.018, 0.032, size=num_companies)
         covariance_matrix = self._build_covariance_matrix(volatilities, correlation_matrix)
         
         # 3. Időbeli paraméterek
@@ -85,20 +85,30 @@ class Utils:
         end_date = base_date + datetime.timedelta(days=days)
         
         # 4. Hírek generálása kapcsolati gráffal
-        all_news_events = self._generate_news_with_relationships(
-            num_news=num_news,
+        # CHANGE: Külön sablonok train/val-re az overfitting ellen
+        train_news_events = self._generate_news_with_relationships(
+            num_news=int(num_news * train_ratio),
             num_companies=num_companies,
             companies=company_symbols,
             sector_map=sector_map,
             start_date=base_date,
-            end_date=end_date
+            end_date=val_start_date,
+            is_validation=False  # Training sablonok
         )
         
-        # 5. Train/val split időbeli alapon
-        train_news_events = [n for n in all_news_events if n.timestamp < val_start_date.timestamp()]
-        val_news_events = [n for n in all_news_events if n.timestamp >= val_start_date.timestamp()]
+        val_news_events = self._generate_news_with_relationships(
+            num_news=int(num_news * (1 - train_ratio)),
+            num_companies=num_companies,
+            companies=company_symbols,
+            sector_map=sector_map,
+            start_date=val_start_date,
+            end_date=end_date,
+            is_validation=True  # Validációs sablonok (más szókincs)
+        )
         
-        # 6. Árfolyamok generálása hírekhez és korrelációhoz igazodva
+        all_news_events = train_news_events + val_news_events
+        
+        # 5. Árfolyamok generálása hírekhez és korrelációhoz igazodva
         sample_prices = self._generate_prices_with_news_impact(
             companies=company_symbols,
             news_events=all_news_events,
@@ -230,9 +240,12 @@ class Utils:
                                          companies: List[str],
                                          sector_map: Dict,
                                          start_date: datetime.datetime,
-                                         end_date: datetime.datetime) -> List[NewsEvent]:
+                                         end_date: datetime.datetime,
+                                         is_validation: bool = False) -> List[NewsEvent]:
         """
         Hírek generálása direkt hatásvektorral h ∈ R^N
+        
+        CHANGE: is_validation paraméter hozzáadva - különböző sablonok train/val-re
         """
         news_events = []
         date_range_seconds = (end_date - start_date).total_seconds()
@@ -240,71 +253,109 @@ class Utils:
         # Szektor → cégindex mapping
         sector_to_companies = {}
         for i, company in enumerate(companies):
-            sector = sector_map.get(company, 'Unknown')
-            if sector not in sector_to_companies:
-                sector_to_companies[sector] = []
-            sector_to_companies[sector].append(i)
+            szektor = sector_map.get(company, 'Unknown')
+            if szektor not in sector_to_companies:
+                sector_to_companies[szektor] = []
+            sector_to_companies[szektor].append(i)
+        
+        # CHANGE: Szinonimák és változatos szókincs az overfitting ellen
+        if is_validation:
+            # Validációs szókincs (SOSEM LÁTOTT a training során)
+            rumor_phrases = ["Market whispers about", "Industry sources claim", "Speculation surrounds", "Unverified reports suggest"]
+            confirm_phrases = ["Official announcement validates", "Company verifies earlier", "Management confirms", "Formal disclosure regarding"]
+            surprise_phrases = ["Shocking revelation about", "Unexpected development at", "Market stunned by", "Unforeseen event impacts"]
+        else:
+            # Training szókincs
+            rumor_phrases = ["Sources suggest", "Rumors circulate about", "Speculation emerges regarding", "Unconfirmed reports indicate"]
+            confirm_phrases = ["Company officially confirms", "Management validates", "Formal announcement confirms", "Official statement verifies"]
+            surprise_phrases = ["Surprise announcement from", "Unexpected news regarding", "Breaking development at", "Unanticipated event affects"]
         
         # Hírsablonok scopeonként és típusonként
-        # Formátum: (template, impact_magnitude, priced_in_factor, decay_rate, lambda_spillover)
+        # CHANGE: Randomizált impact, priced_in, decay, lambda paraméterek
+        # Formátum: (base_template, base_impact, base_priced, base_decay, base_lambda)
         
         company_templates = {
             NewsType.RUMOR: [
-                ("Sources suggest {company} may be planning major restructuring", 0.01, 0.3, 0.5, 0.1),
-                ("Unconfirmed reports of {company} acquisition talks", 0.015, 0.4, 0.5, 0.15),
-                ("Industry insiders hint at {company} product delays", -0.01, 0.3, 0.5, 0.1),
-                ("Whispers of {company} facing supply chain crisis", -0.012, 0.35, 0.5, 0.12),
-                ("Speculation about {company} executive departures", -0.008, 0.4, 0.5, 0.1),
+                ("{phrase} {company} major restructuring plans", 0.01, 0.3, 0.5, 0.1),
+                ("{phrase} {company} potential acquisition discussions", 0.015, 0.4, 0.5, 0.15),
+                ("{phrase} {company} product development setbacks", -0.01, 0.3, 0.5, 0.1),
+                ("{phrase} {company} supply chain complications", -0.012, 0.35, 0.5, 0.12),
+                ("{phrase} {company} leadership transition concerns", -0.008, 0.4, 0.5, 0.1),
             ],
             NewsType.EXPECTED: [
-                ("{company} announces expected quarterly earnings in line with forecasts", 0.005, 0.9, 0.3, 0.05),
-                ("{company} confirms previously announced dividend payment", 0.002, 0.95, 0.2, 0.03),
-                ("{company} reports anticipated product launch on schedule", 0.004, 0.85, 0.3, 0.04),
+                ("{company} reports quarterly results matching analyst expectations", 0.005, 0.9, 0.3, 0.05),
+                ("{company} proceeds with anticipated dividend distribution", 0.002, 0.95, 0.2, 0.03),
+                ("{company} launches product as previously scheduled", 0.004, 0.85, 0.3, 0.04),
             ],
             NewsType.SURPRISE: [
-                ("{company} reports unexpected 30% earnings beat", 0.04, 0.0, 0.4, 0.2),
-                ("{company} CEO unexpectedly resigns effective immediately", -0.03, 0.0, 0.4, 0.15),
-                ("{company} faces surprise regulatory investigation", -0.035, 0.05, 0.5, 0.2),
-                ("{company} issues profit warning, slashes guidance", -0.045, 0.0, 0.5, 0.25),
-                ("{company} hit with massive regulatory fine for compliance violations", -0.04, 0.0, 0.6, 0.22),
-                ("{company} announces unexpected major product recall", -0.038, 0.05, 0.55, 0.2),
-                ("{company} faces class-action lawsuit over safety concerns", -0.032, 0.1, 0.5, 0.18),
-                ("{company} reports cybersecurity breach affecting customer data", -0.028, 0.0, 0.45, 0.16),
+                ("{phrase} {company} earnings significantly exceed forecasts", 0.04, 0.0, 0.4, 0.2),
+                ("{phrase} {company} top executive sudden departure", -0.03, 0.0, 0.4, 0.15),
+                ("{phrase} {company} regulatory probe initiated", -0.035, 0.05, 0.5, 0.2),
+                ("{phrase} {company} profit outlook sharply reduced", -0.045, 0.0, 0.5, 0.25),
+                ("{phrase} {company} substantial compliance penalty imposed", -0.04, 0.0, 0.6, 0.22),
+                ("{phrase} {company} large-scale product withdrawal announced", -0.038, 0.05, 0.55, 0.2),
+                ("{phrase} {company} major legal action filed", -0.032, 0.1, 0.5, 0.18),
+                ("{phrase} {company} data security incident disclosed", -0.028, 0.0, 0.45, 0.16),
             ],
             NewsType.CONFIRMING: [
-                ("{company} officially confirms earlier merger speculation", 0.008, 0.7, 0.3, 0.1),
-                ("{company} validates rumored partnership with tech giant", 0.012, 0.6, 0.3, 0.12),
-                ("{company} confirms anticipated executive shake-up", -0.006, 0.75, 0.3, 0.08),
+                ("{phrase} {company} merger discussions", 0.008, 0.7, 0.3, 0.1),
+                ("{phrase} {company} strategic alliance", 0.012, 0.6, 0.3, 0.12),
+                ("{phrase} {company} management changes", -0.006, 0.75, 0.3, 0.08),
             ],
             NewsType.CONTEXT_DEPENDENT: [
-                ("{company} reports supply chain improvements", 0.015, 0.3, 0.6, 0.15),
-                ("{company} announces cost reduction initiative", 0.01, 0.4, 0.5, 0.1),
-                ("{company} reveals restructuring program details", -0.008, 0.35, 0.5, 0.12),
+                ("{company} reports operational efficiency improvements", 0.015, 0.3, 0.6, 0.15),
+                ("{company} unveils cost optimization strategy", 0.01, 0.4, 0.5, 0.1),
+                ("{company} details organizational transformation", -0.008, 0.35, 0.5, 0.12),
             ]
         }
         
-        sector_templates = [
-            ("Technology sector faces increased regulatory pressure on AI", ['Technology'], -0.02, 0.2, 0.4, 0.3),
-            ("Automotive industry supply chain shows recovery signs", ['Consumer Discretionary'], 0.025, 0.3, 0.4, 0.25),
-            ("Energy sector benefits from rising commodity prices", ['Energy'], 0.03, 0.2, 0.3, 0.35),
-            ("Financial sector impacted by interest rate changes", ['Financials'], 0.015, 0.4, 0.5, 0.3),
-            ("Technology sector hit by antitrust investigations", ['Technology'], -0.025, 0.15, 0.45, 0.32),
-            ("Healthcare sector faces drug pricing legislation", ['Healthcare'], -0.022, 0.25, 0.5, 0.28),
-            ("Energy sector pressured by renewable energy mandates", ['Energy'], -0.018, 0.3, 0.4, 0.25),
-            ("Consumer discretionary weakens on recession fears", ['Consumer Discretionary'], -0.02, 0.2, 0.45, 0.27),
-        ]
+        # CHANGE: Validációs szektorsablonok
+        if is_validation:
+            sector_templates = [
+                ("Tech industry confronts new AI governance challenges", ['Technology'], -0.02, 0.2, 0.4, 0.3),
+                ("Auto sector demonstrates supply resilience", ['Consumer Discretionary'], 0.025, 0.3, 0.4, 0.25),
+                ("Energy companies capitalize on commodity rally", ['Energy'], 0.03, 0.2, 0.3, 0.35),
+                ("Banking sector navigates rate environment shifts", ['Financials'], 0.015, 0.4, 0.5, 0.3),
+                ("Semiconductor firms face inventory correction cycle", ['Technology'], -0.018, 0.25, 0.45, 0.28),
+                ("Retail chains adapt to evolving shopping patterns", ['Consumer Discretionary', 'Consumer Staples'], -0.012, 0.35, 0.4, 0.22),
+                ("Pharmaceutical industry faces pricing reform pressure", ['Healthcare'], -0.022, 0.3, 0.5, 0.32),
+                ("Oil producers respond to OPEC output decisions", ['Energy'], 0.028, 0.15, 0.35, 0.38),
+            ]
+        else:
+            sector_templates = [
+                ("Technology sector faces increased regulatory pressure on AI", ['Technology'], -0.02, 0.2, 0.4, 0.3),
+                ("Automotive industry supply chain shows recovery signs", ['Consumer Discretionary'], 0.025, 0.3, 0.4, 0.25),
+                ("Energy sector benefits from rising commodity prices", ['Energy'], 0.03, 0.2, 0.3, 0.35),
+                ("Financial sector impacted by interest rate changes", ['Financials'], 0.015, 0.4, 0.5, 0.3),
+                ("Chip manufacturers report demand slowdown concerns", ['Technology'], -0.018, 0.25, 0.45, 0.28),
+                ("Consumer discretionary weakens on spending pullback fears", ['Consumer Discretionary', 'Consumer Staples'], -0.012, 0.35, 0.4, 0.22),
+                ("Healthcare sector faces drug pricing legislation", ['Healthcare'], -0.022, 0.3, 0.5, 0.32),
+                ("Energy stocks surge on supply constraint concerns", ['Energy'], 0.028, 0.15, 0.35, 0.38),
+            ]
         
-        market_templates = [
-            ("Federal Reserve raises interest rates by 0.75% to combat inflation", -0.02, 0.3, 0.5, 0.5),
-            ("Fed announces quantitative tightening, reducing liquidity", -0.025, 0.2, 0.6, 0.6),
-            ("Global economic growth forecast revised downward amid recession fears", -0.03, 0.1, 0.5, 0.55),
-            ("Central banks worldwide coordinate monetary policy to stabilize markets", 0.015, 0.4, 0.4, 0.45),
-            ("Trade tensions escalate between major economies", -0.022, 0.2, 0.5, 0.52),
-            ("Unexpected geopolitical crisis triggers market volatility", -0.035, 0.0, 0.6, 0.65),
-            ("Credit market freeze sparks liquidity concerns", -0.04, 0.05, 0.65, 0.7),
-            ("Major bank failure raises systemic risk fears", -0.045, 0.0, 0.7, 0.75),
-            ("Inflation data comes in much hotter than expected", -0.028, 0.1, 0.55, 0.58),
-        ]
+        # CHANGE: Validációs market sablonok
+        if is_validation:
+            market_templates = [
+                ("Central bank implements rate adjustment amid inflation concerns", -0.02, 0.3, 0.5, 0.5),
+                ("Monetary authorities reduce balance sheet holdings", -0.025, 0.2, 0.6, 0.6),
+                ("Global GDP projections lowered on slowdown worries", -0.03, 0.1, 0.5, 0.55),
+                ("International trade friction intensifies", -0.022, 0.2, 0.5, 0.52),
+                ("Currency markets experience heightened volatility", -0.018, 0.25, 0.45, 0.48),
+                ("Sovereign debt concerns emerge in developed markets", -0.032, 0.15, 0.55, 0.58),
+                ("Global coordination on economic stimulus announced", 0.025, 0.3, 0.4, 0.52),
+                ("Labor market data signals economic resilience", 0.015, 0.35, 0.35, 0.45),
+            ]
+        else:
+            market_templates = [
+                ("Federal Reserve raises interest rates by 0.75% to combat inflation", -0.02, 0.3, 0.5, 0.5),
+                ("Fed announces quantitative tightening, reducing liquidity", -0.025, 0.2, 0.6, 0.6),
+                ("Global economic growth forecast revised downward amid recession fears", -0.03, 0.1, 0.5, 0.55),
+                ("Trade tensions escalate between major economies", -0.022, 0.2, 0.5, 0.52),
+                ("Dollar strengthens sharply against major currencies", -0.018, 0.25, 0.45, 0.48),
+                ("Government bond yields spike on fiscal concerns", -0.032, 0.15, 0.55, 0.58),
+                ("Central banks worldwide coordinate monetary policy to stabilize markets", 0.025, 0.3, 0.4, 0.52),
+                ("Employment figures exceed expectations, boost market sentiment", 0.015, 0.35, 0.35, 0.45),
+            ]
         
         # 1. Hírláncok (pletyka → confirming)
         num_chains = int(num_news * 0.15)
@@ -317,7 +368,13 @@ class Utils:
             rumor_template = company_templates[NewsType.RUMOR][
                 np.random.randint(len(company_templates[NewsType.RUMOR]))
             ]
-            text, impact, priced, decay, lambda_sp = rumor_template
+            text, base_impact, base_priced, base_decay, base_lambda = rumor_template
+            
+            # CHANGE: Randomizáljuk a paramétereket (±30% variancia)
+            impact = base_impact * np.random.uniform(0.8, 1.2)
+            priced = np.clip(base_priced * np.random.uniform(0.85, 1.15), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.88, 1.12)
+            lambda_sp = base_lambda * np.random.uniform(0.85, 1.15)
             
             # h vektor: csak ez az egy cég
             h_rumor = np.zeros(num_companies)
@@ -327,8 +384,11 @@ class Utils:
                 seconds=np.random.uniform(0, date_range_seconds * 0.7)
             )
             
+            # CHANGE: Phrase randomizálás
+            phrase = np.random.choice(rumor_phrases)
+            
             rumor_news = NewsEvent(
-                text=text.format(company=company),
+                text=text.format(phrase=phrase, company=company),
                 timestamp=rumor_time.timestamp(),
                 news_type=NewsType.RUMOR,
                 news_scope=NewsScope.COMPANY_SPECIFIC,
@@ -339,7 +399,7 @@ class Utils:
                 requires_context=False,
                 decay_rate=decay,
                 lambda_spillover=lambda_sp,
-                keywords=['rumor', 'speculation'],
+                keywords=[phrase.split()[0].lower(), 'speculation'],  # Dinamikus keyword
                 news_id=self.news_counter
             )
             news_events.append(rumor_news)
@@ -352,13 +412,21 @@ class Utils:
                 confirm_template = company_templates[NewsType.CONFIRMING][
                     np.random.randint(len(company_templates[NewsType.CONFIRMING]))
                 ]
-                text_c, impact_c, priced_c, decay_c, lambda_c = confirm_template
+                text_c, base_impact_c, base_priced_c, base_decay_c, base_lambda_c = confirm_template
+                
+                # CHANGE: Randomizálás confirming hírnél is
+                impact_c = base_impact_c * np.random.uniform(0.82, 1.18)
+                priced_c = np.clip(base_priced_c * np.random.uniform(0.8, 1.2), 0.0, 1.0)
+                decay_c = base_decay_c * np.random.uniform(0.89, 1.11)
+                lambda_c = base_lambda_c * np.random.uniform(0.8, 1.2)
                 
                 h_confirm = np.zeros(num_companies)
                 h_confirm[company_idx] = impact_c
                 
+                phrase_c = np.random.choice(confirm_phrases)
+                
                 confirm_news = NewsEvent(
-                    text=text_c.format(company=company),
+                    text=text_c.format(phrase=phrase_c, company=company),
                     timestamp=confirm_time.timestamp(),
                     news_type=NewsType.CONFIRMING,
                     news_scope=NewsScope.COMPANY_SPECIFIC,
@@ -369,7 +437,7 @@ class Utils:
                     requires_context=False,
                     decay_rate=decay_c,
                     lambda_spillover=lambda_c,
-                    keywords=['confirmed', 'official'],
+                    keywords=[phrase_c.split()[0].lower(), 'official'],
                     news_id=self.news_counter
                 )
                 news_events.append(confirm_news)
@@ -379,7 +447,13 @@ class Utils:
         num_sector = int(num_news * 0.2)
         for _ in range(num_sector):
             template = sector_templates[int(np.random.randint(len(sector_templates)))]
-            text, affected_sectors, impact, priced, decay, lambda_sp = template
+            text, affected_sectors, base_impact, base_priced, base_decay, base_lambda = template
+            
+            # CHANGE: Randomizálás
+            impact = base_impact * np.random.uniform(0.78, 1.22)
+            priced = np.clip(base_priced * np.random.uniform(0.91, 1.09), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.85, 1.15)
+            lambda_sp = base_lambda * np.random.uniform(0.8, 1.2)
             
             # h vektor: minden érintett szektorban azonos hatás
             h_sector = np.zeros(num_companies)
@@ -412,7 +486,13 @@ class Utils:
         num_market = int(num_news * 0.15)
         for _ in range(num_market):
             template = market_templates[int(np.random.randint(len(market_templates)))]
-            text, impact, priced, decay, lambda_sp = template
+            text, base_impact, base_priced, base_decay, base_lambda = template
+            
+            # CHANGE: Randomizálás
+            impact = base_impact * np.random.uniform(0.84, 1.16)
+            priced = np.clip(base_priced * np.random.uniform(0.8, 1.2), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.88, 1.12)
+            lambda_sp = base_lambda * np.random.uniform(0.95, 1.05)
             
             # h vektor: mindenki egyformán érintett
             h_market = np.ones(num_companies) * impact
@@ -446,7 +526,13 @@ class Utils:
             template1 = company_templates[NewsType.CONTEXT_DEPENDENT][
                 np.random.randint(len(company_templates[NewsType.CONTEXT_DEPENDENT]))
             ]
-            text1, impact1, priced1, decay1, lambda1 = template1
+            text1, base_impact1, base_priced1, base_decay1, base_lambda1 = template1
+            
+            # CHANGE: Randomizálás
+            impact1 = base_impact1 * np.random.uniform(0.9, 1.1)
+            priced1 = np.clip(base_priced1 * np.random.uniform(0.9, 1.1), 0.0, 1.0)
+            decay1 = base_decay1 * np.random.uniform(0.85, 1.15)
+            lambda1 = base_lambda1 * np.random.uniform(0.9, 1.1)
             
             h1 = np.zeros(num_companies)
             h1[company_idx] = impact1 * 0.3  # Egyedül kisebb hatás
@@ -486,9 +572,9 @@ class Utils:
                     direct_impact_vector=h2,
                     impact_magnitude=impact1,
                     related_news_ids=[news1_id],
-                    priced_in_factor=0.3,
+                    priced_in_factor=np.random.uniform(0.2, 0.4),  # CHANGE: Randomizált
                     requires_context=True,
-                    decay_rate=0.3,
+                    decay_rate=np.random.uniform(0.25, 0.35),
                     lambda_spillover=lambda1,
                     keywords=['strategy', 'context'],
                     news_id=self.news_counter
@@ -503,7 +589,13 @@ class Utils:
             template = company_templates[news_type][
                 np.random.randint(len(company_templates[news_type]))
             ]
-            text, impact, priced, decay, lambda_sp = template
+            text, base_impact, base_priced, base_decay, base_lambda = template
+            
+            # CHANGE: Randomizálás
+            impact = base_impact * np.random.uniform(0.86, 1.14)
+            priced = np.clip(base_priced * np.random.uniform(0.8, 1.2), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.95, 1.05)
+            lambda_sp = base_lambda * np.random.uniform(0.87, 1.13)
             
             company_idx = np.random.randint(num_companies)
             company = companies[company_idx]
@@ -513,8 +605,15 @@ class Utils:
             
             news_time = start_date + datetime.timedelta(seconds=np.random.uniform(0, date_range_seconds))
             
+            # CHANGE: Phrase randomizálás SURPRISE híreknél
+            if news_type == NewsType.SURPRISE and '{phrase}' in text:
+                phrase = np.random.choice(surprise_phrases)
+                formatted_text = text.format(phrase=phrase, company=company)
+            else:
+                formatted_text = text.format(company=company) if '{company}' in text else text
+            
             news = NewsEvent(
-                text=text.format(company=company),
+                text=formatted_text,
                 timestamp=news_time.timestamp(),
                 news_type=news_type,
                 news_scope=NewsScope.COMPANY_SPECIFIC,
@@ -550,6 +649,8 @@ class Utils:
         - h: direkt hírhatás vektor
         - λ: spillover erősítési paraméter
         - Σ: kovarianciamátrix
+        
+        CHANGE: Volatility clustering hozzáadva a realisztikusabb árfolyammozgáshoz
         """
         n_companies = len(companies)
         
@@ -559,6 +660,15 @@ class Utils:
             covariance_matrix, 
             size=days
         )
+        
+        # CHANGE: Volatility clustering (GARCH-szerű hatás)
+        volatility_multiplier = np.ones(days)
+        base_vol = 1.0
+        for t in range(1, days):
+            # Nagy mozgások után nagyobb volatilitás
+            prev_abs_return = np.mean(np.abs(base_returns[t-1]))
+            volatility_multiplier[t] = base_vol + 0.4 * (prev_abs_return > 0.02) + 0.2 * (prev_abs_return > 0.01)
+            base_returns[t] *= volatility_multiplier[t]
         
         # Hírek hatásának számítása: Δr = h + λ * Σ * h
         news_impact = np.zeros((days, n_companies))
@@ -597,6 +707,11 @@ class Utils:
         
         # Végső hozamok
         final_returns = base_returns + news_impact
+        
+        # CHANGE: Momentum hatás (kis autokorrekció)
+        for t in range(5, days):
+            momentum = 0.05 * np.mean(final_returns[t-5:t], axis=0)
+            final_returns[t] += momentum
         
         # Árak számítása
         price_data = {}

@@ -433,5 +433,4 @@ class NewsDataProcessor:
                 else:
                     corr = 0.0
                 correlation_pairs.append(abs(corr))  # Use absolute correlation
-
         return correlation_pairs

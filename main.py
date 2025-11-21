@@ -92,7 +92,7 @@ if __name__ == "__main__":
         training_data=training_data,
         validation_data=validation_data,
         epochs=60,
-        batch_size=8
+        batch_size=16
         )
 
     # --- TRADING SYSTEM SETUP ---
@@ -183,11 +183,7 @@ if __name__ == "__main__":
     # --- VISUALIZATION ---
     logger.info("\n📊 Generating uncertainty prediction visualization...")
     analysis_to_plot = news_impact[target_companies[0]]
-    fig = performance_analyzer.visualize_uncertainty_predictions(
-        analysis_to_plot, 
-        data_processor.companies, 
-        test_news
-    )
+    fig = performance_analyzer.visualize_uncertainty_predictions(analysis_to_plot, test_news)
     plt.savefig('probabilistic_predictions.png', dpi=150, bbox_inches='tight')
     logger.info("✅ Saved to 'probabilistic_predictions.png'")
 
@@ -227,7 +223,7 @@ if __name__ == "__main__":
     # --- TOPOLOGICAL VALIDATION ---
     logger.info("\n%s", "=" * 60)
     logger.info("TOPOLOGICAL SMOOTHNESS VALIDATION")
-    logger.info("="*80)
+    logger.info("="*60)
     logger.info("Purpose: Validate model stability by checking if similar news")
     logger.info("         (in embedding space) produce similar impact predictions")
     
@@ -249,7 +245,7 @@ if __name__ == "__main__":
     
     logger.info("\n%s", "=" * 60)
     logger.info("TOPOLOGICAL VALIDATION SUMMARY")
-    logger.info("="*80)
+    logger.info("="*60)
     logger.info("  Embedding-Impact Correlation: %.4f", correlation_rm)
     logger.info("  Assessment: %s", assessment.upper())
     logger.info("  Unstable pairs: %d/%d", num_unstable, smoothness_results['num_pairs'])
@@ -266,8 +262,7 @@ if __name__ == "__main__":
         logger.warning("\n⚠️  Model shows WEAK topological stability")
         logger.warning("   → Similar news may produce unpredictable impacts")
         logger.warning("   → Consider: more training data, regularization, or architecture changes")
-    
-    logger.info("="*80)
+    logger.info("="*60)
 
     # ============================================================================
     # TEST WITH GLOBAL NEWS
