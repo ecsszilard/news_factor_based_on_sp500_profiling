@@ -4,8 +4,10 @@ import logging
 from scipy.spatial.distance import pdist
 from sklearn.preprocessing import StandardScaler
 from typing import Dict, List
+import tensorflow as tf
 
 logger = logging.getLogger("AdvancedNewsFactor.TopologicalValidator")
+models = tf.keras.models
 
 class TopologicalValidator:
     """
@@ -35,6 +37,7 @@ class TopologicalValidator:
         self.performance_analyzer = performance_analyzer
         self.trading_system = performance_analyzer.trading_system
         self.data_processor = performance_analyzer.trading_system.data_processor
+        self.news_factor_model = performance_analyzer.trading_system.data_processor.news_factor_model
         
         logger.info("TopologicalValidator initialized")
     
@@ -224,7 +227,7 @@ class TopologicalValidator:
         
         # 5. Visualize smoothness map
         logger.info("\n[5/5] Generating smoothness heatmap...")
-        fig = self.plot_smoothness_map(R, M, save_path)
+        self.plot_smoothness_map(R, M, val_news, save_path)
         
         # 6. Statistical analysis
         logger.info("\n%s", "=" * 60)
@@ -305,20 +308,26 @@ class TopologicalValidator:
     def plot_smoothness_map(self, 
                            R: np.ndarray, 
                            M: np.ndarray,
+                           val_news,
                            save_path: str) -> plt.Figure:
         """
-        2D Density Heatmap: Smoothness Map
+        Combined visualization: Smoothness Map + Gate Analysis
         
-        X-axis: Embedding distance (R_ij) - "Similar News ↔ Different News"
-        Y-axis: Impact distance (M_ij) - "Similar Impact ↔ Different Impact"
+        Plot 1 (Left): 2D Density Heatmap - Smoothness Map
+            X-axis: Embedding distance (R_ij) - "Similar News ↔ Different News"
+            Y-axis: Impact distance (M_ij) - "Similar Impact ↔ Different Impact"
+            Ideal case: positive correlation (diagonal band)
+            - Small R → small M (similar news, similar impact)
+            - Large R → large M (different news, different impact)
         
-        Ideal case: positive correlation (diagonal band)
-        - Small R → small M (similar news, similar impact)
-        - Large R → large M (different news, different impact)
+        Plot 2 (Right): Bar Chart - Pairwise Adaptive Gate Analysis
+            Shows how model balances baseline correlation trust vs. delta learning
+            by news type. α close to 1 = trust baseline, α close to 0 = trust delta.
         
         Args:
             R: Embedding distances (condensed)
             M: Impact distances (condensed)
+            val_news: List of news items from validation set
             save_path: Output file path
             
         Returns:
@@ -326,7 +335,9 @@ class TopologicalValidator:
         """
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         
-        # Plot 1: 2D Hexbin (density)
+        # ===========================================
+        # Plot 1: Smoothness Map (2D Hexbin density)
+        # ===========================================
         ax1 = axes[0]
         hexbin = ax1.hexbin(R, M, gridsize=30, cmap='YlOrRd', mincnt=1)
         ax1.set_xlabel('Embedding Distance (R) →\n← Similar News | Different News →', fontsize=12, fontweight='bold')
@@ -334,30 +345,18 @@ class TopologicalValidator:
         ax1.set_title('Smoothness Map: Embedding Space vs Impact Space', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
-        # Add diagonal reference line (perfect smoothness)
-        ax1.plot([0, R.max()], [0, M.max()], 'b--', linewidth=2, label='Perfect Smoothness', alpha=0.7)
-        ax1.legend(loc='upper left', fontsize=10)
-        
-        cbar1 = plt.colorbar(hexbin, ax=ax1)
-        cbar1.set_label('Number of News Pairs', fontsize=11)
-        
-        # Plot 2: Scatter with trend
-        ax2 = axes[1]
-        
-        # Scatter plot with transparency
-        ax2.scatter(R, M, alpha=0.3, s=20, c='steelblue', edgecolors='none')
-        
         # Add polynomial fit
         z = np.polyfit(R, M, 2)
         p = np.poly1d(z)
         R_smooth = np.linspace(R.min(), R.max(), 100)
         corr_val = np.corrcoef(R, M)[0, 1]
-        ax2.plot(R_smooth, p(R_smooth), 'r-', linewidth=3, label='Trend (correlation: %.3f)' % corr_val)
-        ax2.set_xlabel('Embedding Distance (R)', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Impact Distance (M)', fontsize=12, fontweight='bold')
-        ax2.set_title('Scatter Plot with Trend Line', fontsize=14, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(loc='upper left', fontsize=10)
+
+        # Add diagonal reference line (perfect smoothness)
+        ax1.plot(R_smooth, p(R_smooth), 'r-', linewidth=3, label='Trend (correlation: %.3f)' % corr_val)
+        ax1.legend(loc='upper left', fontsize=10)
+        
+        cbar1 = plt.colorbar(hexbin, ax=ax1)
+        cbar1.set_label('Number of News Pairs', fontsize=11)
         
         # Add text box with statistics
         stats_text = (
@@ -366,14 +365,116 @@ class TopologicalValidator:
             f"M: μ={M.mean():.3f}, σ={M.std():.3f}\n"
             f"Correlation: {corr_val:.4f}"
         )
-        
-        ax2.text(0.98, 0.02, stats_text, transform=ax2.transAxes, fontsize=10, verticalalignment='bottom',
+        ax1.text(0.98, 0.02, stats_text, transform=ax1.transAxes, fontsize=10, verticalalignment='bottom',
                  horizontalalignment='right', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
+        # ===========================================
+        # Plot 2: Pairwise Adaptive Gate Analysis
+        # ===========================================
+        ax2 = axes[1]
+        
+        # Get gate layer
+        try:
+            gate_layer = self.news_factor_model.model.get_layer('pairwise_adaptive_gate')
+        except ValueError:
+            logger.error("Gate layer 'pairwise_adaptive_gate' not found")
+            ax2.text(0.5, 0.5, 'Gate layer not found', ha='center', va='center', fontsize=14)
+            ax2.set_title('Pairwise Adaptive Gate: Analysis Failed', fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            return fig
+        
+        # Build intermediate model to extract gate outputs
+        keyword_input = self.news_factor_model.model.input[0]
+        intermediate_model = models.Model(inputs=keyword_input, outputs=gate_layer.output)
+        
+        # Collect gate statistics by news type
+        stats_by_type = {}
+        
+        for news_item in val_news[:30]:  # Limit to 30 for speed
+            text = news_item['text']
+            news_type = self.trading_system._classify_news_scope(text, news_item.get('companies', []))
+            
+            # Prepare inputs
+            keywords = self.news_factor_model.prepare_keyword_sequence(text)
+            baseline = self.data_processor.baseline_z
+            
+            if keywords.ndim == 1:
+                keywords = keywords[None, :]
+            if baseline.ndim == 2:
+                baseline = baseline[None, ...]
+            
+            # Get gate values (α)
+            alpha_values = intermediate_model.predict([keywords, baseline], verbose=0)[0]
+            alpha_mean = float(np.mean(alpha_values))
+            
+            if news_type not in stats_by_type:
+                stats_by_type[news_type] = []
+            stats_by_type[news_type].append(alpha_mean)
+        
+        # Compute summary statistics
+        summary = {
+            news_type: {
+                'mean_alpha': float(np.mean(alphas)),
+                'std_alpha': float(np.std(alphas)),
+                'count': len(alphas)
+            }
+            for news_type, alphas in stats_by_type.items()
+        }
+        
+        # Create bar chart
+        types = list(summary.keys())
+        means = [summary[t]['mean_alpha'] for t in types]
+        stds = [summary[t]['std_alpha'] for t in types]
+        
+        bars = ax2.bar(types, means, yerr=stds, capsize=5, alpha=0.8, edgecolor='black')
+        # 🎨 Diagnostic coloring based on mean α
+        for bar, mean in zip(bars, means):
+            if mean < 0.30:
+                bar.set_color('crimson')     # too low trust → aggressive gate
+            elif mean < 0.50:
+                bar.set_color('darkorange')  # slightly low trust
+            elif mean < 0.70:
+                bar.set_color('steelblue')   # normal / balanced
+            else:
+                bar.set_color('forestgreen') # overly high trust → conservative gate
+
+        ax2.axhline(0.5, color='gray', linestyle='--', linewidth=2, label='Neutral (α=0.5)')
+        ax2.axhline(0.15, color='red', linestyle=':', linewidth=2, label='Min Trust Floor')
+        ax2.set_xlabel('News Type', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Mean α (Baseline Trust)', fontsize=12, fontweight='bold')
+        ax2.set_title('Pairwise Adaptive Gate: Baseline Trust by News Type', fontsize=14, fontweight='bold')
+        ax2.legend(loc='upper right', fontsize=10)
+        ax2.grid(alpha=0.3, axis='y')
+        ax2.set_ylim(0, 1)
+        
+        # Rotate x-axis labels
+        plt.sca(ax2)
+        plt.xticks(rotation=45, ha='right')
+        
+        # Log statistics
+        logger.info("Gate analysis by news type:")
+        for news_type, stats in summary.items():
+            logger.info("  %s: α=%.3f±%.3f (n=%d)",
+                        news_type.upper(), 
+                        stats['mean_alpha'], 
+                        stats['std_alpha'], 
+                        stats['count'])
+        
+        # Overall assessment
+        if summary:
+            avg_alpha = np.mean([s['mean_alpha'] for s in summary.values()])
+            if 0.4 <= avg_alpha <= 0.6:
+                logger.info("✅ Balanced gate mechanism (α=%.3f)", avg_alpha)
+            elif avg_alpha > 0.6:
+                logger.warning("⚠️ Conservative behavior (α=%.3f) - may underreact to news", avg_alpha)
+            else:
+                logger.warning("⚠️ Aggressive behavior (α=%.3f) - may overreact to news", avg_alpha)
+        
+        # Save figure
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        logger.info("✅ Smoothness map saved to '%s'", save_path)
-        return fig
+        logger.info("✅ Smoothness map + Gate analysis saved to '%s'", save_path)
     
     def analyze_impact_vector_components(self, impact_vectors: np.ndarray):
         """

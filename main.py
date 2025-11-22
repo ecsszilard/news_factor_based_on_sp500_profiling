@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import warnings
 import matplotlib.pyplot as plt
 import logging
@@ -66,10 +67,11 @@ if __name__ == "__main__":
     news_model = AttentionBasedNewsFactorModel(
         tokenizer,
         bert_model,
-        num_companies=len(sample_prices.keys()), 
-        max_keywords=128, 
+        num_companies=len(sample_prices.keys()),
+        min_sigma=0.01,
+        max_keywords=128,
         keyword_dim=256,
-        company_dim=128, 
+        company_dim=128,
         latent_dim=256
     )
     logger.info("✅ Model initialized with dual output (μ, σ²)")
@@ -263,7 +265,7 @@ if __name__ == "__main__":
         logger.warning("   → Similar news may produce unpredictable impacts")
         logger.warning("   → Consider: more training data, regularization, or architecture changes")
     logger.info("="*60)
-
+    
     # ============================================================================
     # TEST WITH GLOBAL NEWS
     # ============================================================================

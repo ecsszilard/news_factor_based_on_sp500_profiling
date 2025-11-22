@@ -371,9 +371,9 @@ class Utils:
             text, base_impact, base_priced, base_decay, base_lambda = rumor_template
             
             # CHANGE: Randomizáljuk a paramétereket (±30% variancia)
-            impact = base_impact * np.random.uniform(0.8, 1.2)
-            priced = np.clip(base_priced * np.random.uniform(0.85, 1.15), 0.0, 1.0)
-            decay = base_decay * np.random.uniform(0.88, 1.12)
+            impact = base_impact * np.random.uniform(0.96, 1.04)
+            priced = np.clip(base_priced * np.random.uniform(0.95, 1.05), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.98, 1.02)
             lambda_sp = base_lambda * np.random.uniform(0.85, 1.15)
             
             # h vektor: csak ez az egy cég
@@ -415,10 +415,10 @@ class Utils:
                 text_c, base_impact_c, base_priced_c, base_decay_c, base_lambda_c = confirm_template
                 
                 # CHANGE: Randomizálás confirming hírnél is
-                impact_c = base_impact_c * np.random.uniform(0.82, 1.18)
+                impact_c = base_impact_c * np.random.uniform(0.92, 1.08)
                 priced_c = np.clip(base_priced_c * np.random.uniform(0.8, 1.2), 0.0, 1.0)
                 decay_c = base_decay_c * np.random.uniform(0.89, 1.11)
-                lambda_c = base_lambda_c * np.random.uniform(0.8, 1.2)
+                lambda_c = base_lambda_c * np.random.uniform(0.94, 1.06)
                 
                 h_confirm = np.zeros(num_companies)
                 h_confirm[company_idx] = impact_c
@@ -450,10 +450,10 @@ class Utils:
             text, affected_sectors, base_impact, base_priced, base_decay, base_lambda = template
             
             # CHANGE: Randomizálás
-            impact = base_impact * np.random.uniform(0.78, 1.22)
+            impact = base_impact * np.random.uniform(0.92, 1.08)
             priced = np.clip(base_priced * np.random.uniform(0.91, 1.09), 0.0, 1.0)
-            decay = base_decay * np.random.uniform(0.85, 1.15)
-            lambda_sp = base_lambda * np.random.uniform(0.8, 1.2)
+            decay = base_decay * np.random.uniform(0.95, 1.05)
+            lambda_sp = base_lambda * np.random.uniform(0.99, 1.01)
             
             # h vektor: minden érintett szektorban azonos hatás
             h_sector = np.zeros(num_companies)
@@ -489,9 +489,9 @@ class Utils:
             text, base_impact, base_priced, base_decay, base_lambda = template
             
             # CHANGE: Randomizálás
-            impact = base_impact * np.random.uniform(0.84, 1.16)
-            priced = np.clip(base_priced * np.random.uniform(0.8, 1.2), 0.0, 1.0)
-            decay = base_decay * np.random.uniform(0.88, 1.12)
+            impact = base_impact * np.random.uniform(0.9, 1.1)
+            priced = np.clip(base_priced * np.random.uniform(0.9, 1.1), 0.0, 1.0)
+            decay = base_decay * np.random.uniform(0.98, 1.02)
             lambda_sp = base_lambda * np.random.uniform(0.95, 1.05)
             
             # h vektor: mindenki egyformán érintett
@@ -529,9 +529,9 @@ class Utils:
             text1, base_impact1, base_priced1, base_decay1, base_lambda1 = template1
             
             # CHANGE: Randomizálás
-            impact1 = base_impact1 * np.random.uniform(0.9, 1.1)
+            impact1 = base_impact1 * np.random.uniform(0.94, 1.16)
             priced1 = np.clip(base_priced1 * np.random.uniform(0.9, 1.1), 0.0, 1.0)
-            decay1 = base_decay1 * np.random.uniform(0.85, 1.15)
+            decay1 = base_decay1 * np.random.uniform(0.91, 1.09)
             lambda1 = base_lambda1 * np.random.uniform(0.9, 1.1)
             
             h1 = np.zeros(num_companies)
@@ -592,8 +592,8 @@ class Utils:
             text, base_impact, base_priced, base_decay, base_lambda = template
             
             # CHANGE: Randomizálás
-            impact = base_impact * np.random.uniform(0.86, 1.14)
-            priced = np.clip(base_priced * np.random.uniform(0.8, 1.2), 0.0, 1.0)
+            impact = base_impact * np.random.uniform(0.89, 1.11)
+            priced = np.clip(base_priced * np.random.uniform(0.9, 1.1), 0.0, 1.0)
             decay = base_decay * np.random.uniform(0.95, 1.05)
             lambda_sp = base_lambda * np.random.uniform(0.87, 1.13)
             

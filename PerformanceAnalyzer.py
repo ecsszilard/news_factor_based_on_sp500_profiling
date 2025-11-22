@@ -97,7 +97,6 @@ class PerformanceAnalyzer:
         cumulative = np.cumprod(1 + np.array(returns))
         running_max = np.maximum.accumulate(cumulative)
         drawdown = (cumulative - running_max) / running_max
-        
         return abs(min(drawdown))
 
     # ========================================================================
@@ -152,7 +151,6 @@ class PerformanceAnalyzer:
         
         embeddings = np.array(embeddings)
         logger.info("✅ Extracted embeddings: shape %s", embeddings.shape)
-        
         return embeddings, true_types
     
     def cluster_news_embeddings(self, 
@@ -314,8 +312,6 @@ class PerformanceAnalyzer:
             logger.info("  Avg Impact: %.4f", cluster_stats[cluster_id]['avg_impact'])
             logger.info("  Dominant Scope: %s", cluster_stats[cluster_id]['dominant_scope'])
             logger.info("  Top Keywords: %s", cluster_stats[cluster_id]['top_keywords'])
-
-        
         return cluster_stats
     
     def _get_top_keywords(self, keywords_list: List[str], top_k: int = 5) -> List[str]:
@@ -730,5 +726,4 @@ class PerformanceAnalyzer:
         plt.tight_layout()
         plt.savefig('calibration_curve.png', dpi=150, bbox_inches='tight')
         logger.info("✅ Saved to 'calibration_curve.png'")
-        
         return fig

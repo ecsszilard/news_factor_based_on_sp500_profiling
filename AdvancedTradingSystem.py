@@ -31,48 +31,6 @@ class AdvancedTradingSystem:
         
         logger.info("AdvancedTradingSystem initialized with Probabilistic Residual Learning")
     
-    def analyze_prediction_quality(self, predictions, actuals, baseline):
-        """
-        Analyze the quality of probabilistic predictions
-        
-        predictions: dict with 'mean', 'std', 'confidence'
-        actuals: actual post-news correlations
-        baseline: baseline correlations
-        """
-        mu = predictions['mean']
-        sigma = predictions['std']
-        
-        # Prediction errors
-        errors = np.abs(actuals - mu)
-        
-        # Check calibration: are high-sigma predictions actually more uncertain?
-        high_sigma_mask = sigma > np.median(sigma)
-        low_sigma_mask = sigma <= np.median(sigma)
-        
-        high_sigma_error = np.mean(errors[high_sigma_mask])
-        low_sigma_error = np.mean(errors[low_sigma_mask])
-        
-        # Good calibration: high_sigma_error >> low_sigma_error
-        calibration_ratio = high_sigma_error / (low_sigma_error + 1e-6)
-        
-        # Improvement over baseline
-        baseline_errors = np.abs(actuals - baseline)
-        model_errors = errors
-        
-        improvement = np.mean(baseline_errors) - np.mean(model_errors)
-        improvement_pct = 100 * improvement / np.mean(baseline_errors)
-        
-        return {
-            'mean_absolute_error': np.mean(errors),
-            'high_sigma_error': high_sigma_error,
-            'low_sigma_error': low_sigma_error,
-            'calibration_ratio': calibration_ratio,
-            'improvement_over_baseline': improvement,
-            'improvement_percentage': improvement_pct,
-            'avg_sigma_z': np.mean(sigma),
-            'confidence_score': predictions['total_confidence']
-        }
-    
     def _classify_news_scope(self, news_text, mentioned_companies):
         """
         Detect if news is global/macro or company-specific

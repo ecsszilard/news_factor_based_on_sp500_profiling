@@ -20,6 +20,128 @@ metrics = tf.keras.metrics
 losses = tf.keras.losses
 initializers = tf.keras.initializers
 
+class CompoundProbabilisticLoss(losses.Loss):
+    """
+    Compact probabilistic loss for correlation prediction with uncertainty.
+
+    Components:
+    1. **CRPS (Continuous Ranked Probability Score)** – main distributional loss  
+       - Evaluates both accuracy and calibration; no separate calibration penalty needed.  
+       - Closed form for Gaussian: CRPS(N(μ,σ²), y) = σ[z(2Φ(z)-1) + 2φ(z) - 1/√π], z=(y–μ)/σ.  
+       - Balances mean accuracy and uncertainty without extra tuning.
+
+    2. **Adaptive weighting** – highlights important prediction pairs  
+       - Higher weight for pairs involving news-affected companies.  
+       - Larger |Δ_corr| gets proportionally higher weight.  
+       - Normalized to mean = 1 for stable gradients.
+
+    3. **Variance floor penalty** – prevents overconfident, collapsed σ  
+       - Small penalty (λ_var ≈ 1e-4) discourages σ → 0.  
+       - Avoids degenerate “fake certainty” solutions while staying minimally intrusive.
+
+    4. **Directional hinge (high-confidence only)** – improves trading usefulness  
+       - Activates when σ < threshold (model claims high confidence).  
+       - Penalizes wrong direction: sign(Δ_pred) ≠ sign(Δ_actual).  
+       - Margin avoids trivial Δ_pred ≈ 0 predictions.  
+       - Penalty increases as confidence grows.
+
+    Args:
+        min_sigma: Minimum allowed standard deviation.  
+        affected_weight: Weight multiplier for news-affected pairs (e.g., 3.3).  
+        magnitude_weight: Weight per unit of |Δ_corr| (e.g., 1.2).  
+        lambda_var: Variance-floor penalty weight (e.g., 1e-4).  
+        lambda_dir: Directional hinge weight (e.g., 1e-2).  
+        high_conf_threshold: σ threshold for activating directional loss (e.g., 0.85).  
+        directional_margin: Margin for the directional hinge (e.g., 0.05 in Fisher-z space).
+
+    Returns:
+        A scalar loss combining weighted CRPS, variance-floor penalty,
+        and confidence-conditioned directional hinge.
+    """
+    def __init__(self, 
+                 min_sigma=1e-2,  # ← FONTOS: ne engedjük túl kicsire
+                 affected_weight=3.3, 
+                 magnitude_weight=1.2,
+                 lambda_var=1e-4,
+                 lambda_dir=1e-2,
+                 high_conf_threshold=0.85,
+                 directional_margin=0.04,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.min_sigma = float(min_sigma)
+        self.affected_weight = float(affected_weight)
+        self.magnitude_weight = float(magnitude_weight)
+        self.lambda_var = float(lambda_var)
+        self.lambda_dir = float(lambda_dir)
+        self.high_conf_threshold = float(high_conf_threshold)
+        self.directional_margin = float(directional_margin)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'min_sigma': self.min_sigma,
+            'affected_weight': self.affected_weight,
+            'magnitude_weight': self.magnitude_weight,
+            'lambda_var': self.lambda_var,
+            'lambda_dir': self.lambda_dir,
+            'high_conf_threshold': self.high_conf_threshold,
+            'directional_margin': self.directional_margin
+        })
+        return config
+    
+    def crps_gaussian(self, y_true, mu, sigma):
+        z = (y_true - mu) / (sigma + 1e-12)
+        cdf_z = 0.5 * (1.0 + tf.math.erf(z / tf.sqrt(2.0)))
+        pdf_z = tf.exp(-0.5 * tf.square(z)) / tf.sqrt(2.0 * np.pi)
+        return sigma * (z * (2.0 * cdf_z - 1.0) + 2.0 * pdf_z - 1.0 / tf.sqrt(np.pi))
+    
+    def call(self, y_true, y_pred):
+        actual_corr = y_true[..., 0]
+        baseline_corr = y_true[..., 1]
+        affected_mask = tf.cast(y_true[..., 2], tf.float32)
+        
+        mu = y_pred[..., 0]
+        raw_logvar = tf.clip_by_value(y_pred[..., 1], -6.0, 10.0)
+        
+        # Variance construction with floor
+        var = tf.nn.softplus(raw_logvar) + self.min_sigma
+        sigma = tf.sqrt(var)
+        
+        # 1. CRPS Loss
+        crps_elem = self.crps_gaussian(actual_corr, mu, sigma)
+        
+        # Normalized weighting
+        affected_weights = 1.0 + (self.affected_weight - 1.0) * affected_mask
+        magnitude = tf.abs(actual_corr - baseline_corr)
+        total_weights = affected_weights * (1.0 + self.magnitude_weight * magnitude)
+        total_weights_norm = total_weights / (tf.reduce_mean(total_weights) + 1e-12)
+        
+        weighted_crps = tf.reduce_mean(crps_elem * total_weights_norm)
+        
+        # 2. Minimal variance floor penalty (prevents collapse)
+        if self.lambda_var > 0:
+            shortfall = tf.nn.relu(self.min_sigma - var)
+            var_penalty = self.lambda_var * tf.reduce_mean(shortfall)
+        else:
+            var_penalty = 0.0
+        
+        # 3. Directional hinge loss (improved version)
+        actual_delta = actual_corr - baseline_corr
+        pred_delta = mu - baseline_corr
+        
+        # Confidence weight: smooth from 0 (uncertain) to 1 (confident)
+        conf_weight = tf.clip_by_value(
+            (self.high_conf_threshold - sigma) / self.high_conf_threshold, 
+            0.0, 1.0
+        )
+        
+        # Hinge: penalize wrong direction proportionally
+        dir_violation = tf.nn.relu(-tf.sign(actual_delta) * pred_delta + self.directional_margin)
+        
+        # Apply confidence-weighted penalty
+        dir_loss = self.lambda_dir * tf.reduce_mean(conf_weight * dir_violation)
+        return weighted_crps + var_penalty + dir_loss
+    
 class HighConfidenceDirectionalAccuracy(metrics.Metric):
     """
     Measures how often the model predicts the *correct direction* of correlation change
@@ -78,76 +200,6 @@ class HighConfidenceDirectionalAccuracy(metrics.Metric):
         self.correct_high_conf.assign(0.0)
         self.total_high_conf.assign(0.0)
 
-class WeightedNegativeLogLikelihoodLoss(losses.Loss):
-    """
-    Stable, weighted negative log-likelihood loss for probabilistic (mu, log-var) outputs.
-
-    - Ensures numerical stability via logvar clipping and softplus-based positive variance.
-    - Emphasizes important pairs using affected-company and magnitude-based weighting (normalized to mean 1).
-    - Adds an optional variance-floor penalty to prevent overconfidence (variance collapse).
-    """
-    def __init__(self, 
-                 min_sigma, 
-                 affected_weight, 
-                 magnitude_weight, 
-                 variance_penalty_weight,
-                 variance_floor,
-                 **kwargs):
-        super().__init__(**kwargs)
-        self.min_sigma = float(min_sigma)
-        self.affected_weight = float(affected_weight) # weight for pairs involving affected companies
-        self.magnitude_weight = float(magnitude_weight) # weight for high-change pairs
-        self.variance_penalty_weight = float(variance_penalty_weight) # minimum variance to prevent overconfidence
-        self.variance_floor = float(variance_floor)
-    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'min_sigma': self.min_sigma,
-            'affected_weight': self.affected_weight,
-            'magnitude_weight': self.magnitude_weight,
-            'variance_penalty_weight': self.variance_penalty_weight,
-            'variance_floor': self.variance_floor
-        })
-        return config
-    
-    def call(self, y_true, y_pred):
-        """
-        y_true: [batch, N, N, 3] -> [actual_corr, baseline_corr, affected_mask]
-        y_pred: [batch, N, N, 2] -> [mu, raw_logvar_pred]
-        """
-        actual_corr = y_true[..., 0]
-        baseline_corr = y_true[..., 1]
-        affected_mask = tf.cast(y_true[..., 2], tf.float32)
-        
-        mu = y_pred[..., 0]  # [batch, N, N]
-        raw_logvar = y_pred[..., 1]  # [batch, N, N]
-        raw_logvar = tf.clip_by_value(raw_logvar, -6.0, 10.0) # to avoid underflow and overflow of exp(), which leads to an explosion of loss
-        
-        # stable variance construction: softplus ensures positivity, min_sigma avoids division by zero
-        var = tf.nn.softplus(raw_logvar) + self.min_sigma
-        # standard NLL per element
-        sq_err = tf.square(actual_corr - mu)
-
-        # weights per element
-        affected_weights = 1.0 + (self.affected_weight - 1.0) * affected_mask
-        actual_change = tf.abs(actual_corr - baseline_corr)        
-        total_weights = affected_weights * (1.0 + self.magnitude_weight * actual_change)
-
-        # normalize weights so average weight == 1 to preserve loss scale
-        total_weights_norm = total_weights / (tf.reduce_mean(total_weights) + 1e-12)
-        
-        # compute weighted mean properly (sum(weights * loss) / sum(weights))
-        weighted_nll = tf.reduce_mean(0.5 * (sq_err / var + tf.math.log(var + 1e-12)) * total_weights_norm)
-        
-        # small penalty to prevent variances collapsing to extremely small values
-        if self.variance_penalty_weight > 0.0:
-            shortfall = tf.nn.relu(self.variance_floor - var)
-            var_penalty = self.variance_penalty_weight * tf.reduce_mean(shortfall)
-        else:
-            var_penalty = 0.0
-        return weighted_nll + var_penalty
-
 class CalibrationMetric(metrics.Metric):
     """
     Measures how well the predicted uncertainty (σ) matches actual errors
@@ -158,8 +210,8 @@ class CalibrationMetric(metrics.Metric):
         self.min_sigma = float(min_sigma)
         self.num_bins = num_bins
         self.bin_errors = self.add_weight(
-            name='bin_errors', 
-            shape=(num_bins,), 
+            name='bin_errors',
+            shape=(num_bins,),
             initializer='zeros'
         )
         self.bin_counts = self.add_weight(
@@ -215,10 +267,89 @@ class CalibrationMetric(metrics.Metric):
         self.bin_errors.assign(tf.zeros_like(self.bin_errors))
         self.bin_counts.assign(tf.zeros_like(self.bin_counts))
 
-class TemperatureGatedDense(layers.Layer):
+class KeywordEncoderBlock(layers.Layer):
     """
-    Dense → temperature-scaled sigmoid gate with optional L1 activity regularization.
-    Enables learnable control over how strongly each feature is passed through.
+    Attention-based keyword encoder:
+    - MultiHeadAttention with learnable temperature
+    - Residual + LayerNorm
+    - Global average + max pooling over tokens
+    - Optional projection to latent_dim
+    
+    Output:
+        smooth_global: [batch, latent_dim]
+        processed_tokens: [batch, seq_len, feature_dim]
+    """
+    def __init__(self, num_heads, key_dim, latent_dim, dropout_rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.latent_dim = latent_dim
+        self.dropout_rate = dropout_rate
+
+    def build(self, input_shape):
+        self.attn = layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.key_dim,
+            dropout=self.dropout_rate
+        )
+        self.dropout = layers.Dropout(self.dropout_rate)
+        self.layer_norm = layers.LayerNormalization()
+
+        # Learnable scaling of attention output
+        self.temperature = self.add_weight(
+            name='temperature',
+            shape=(),
+            initializer='ones',
+            trainable=True
+        )
+
+        # Projection for smooth global representation
+        self.global_proj = layers.Dense(
+            self.latent_dim,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5)
+        )
+
+        super().build(input_shape)
+
+    def call(self, token_embeddings, training=None):
+        # 1) Multi-head attention
+        attn_out = self.attn(
+            token_embeddings, token_embeddings, token_embeddings,
+            training=training
+        )
+        attn_out = attn_out * tf.nn.softplus(self.temperature)
+
+        # 2) Residual + LN
+        processed_tokens = self.layer_norm(
+            token_embeddings + self.dropout(attn_out, training=training)
+        )  # [batch, seq_len, feature_dim]
+
+        # 3) Global features (avg + max)
+        global_avg = tf.reduce_mean(processed_tokens, axis=1)
+        global_max = tf.reduce_max(processed_tokens, axis=1)
+        global_features = tf.concat([global_avg, global_max], axis=-1)
+
+        # 4) Smooth latent projection
+        smooth_global = self.global_proj(global_features)
+
+        return smooth_global, processed_tokens
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "latent_dim": self.latent_dim,
+            "dropout_rate": self.dropout_rate,
+        })
+        return config
+
+class AdaptiveGate(layers.Layer):
+    """
+    Dense → learnable-temperature sigmoid gate.
+    Controls (0..1) how much each local feature passes through.
+    Optional L1 penalty encourages sparse, selective gating.
     """
     def __init__(self, units, initial_temperature=1.0, activity_l1=0.0, **kwargs):
         super().__init__(**kwargs)
@@ -269,62 +400,80 @@ class TemperatureGatedDense(layers.Layer):
         })
         return config
 
-class OptimizedAttentionLayer(layers.Layer):
-    def __init__(self, num_heads, key_dim, dropout_rate=0.1, **kwargs):
+class LocalEdgeBlock(layers.Layer):
+    """
+    Local feature refinement block:
+    - Elementwise gating of conv features
+    - Top-k mean pooling over tokens
+    - Dropout
+    - Projection to latent_dim
+    """
+    def __init__(self, latent_dim, top_k=3, dropout_rate=0.4, activity_l2=1e-4, **kwargs):
         super().__init__(**kwargs)
-        self.num_heads = num_heads
-        self.key_dim = key_dim
+        self.latent_dim = latent_dim
+        self.top_k = top_k
         self.dropout_rate = dropout_rate
-        self.attention = None
-        self.layer_norm = None
-        self.dropout = None
-        
-        # Scaled attention with learnable temperature
-        self.temperature = self.add_weight(
-            shape=(), initializer='ones', trainable=True, name='temperature'
+        self.activity_l2 = activity_l2
+
+    def build(self, input_shapes):
+        # Final projection after pooling
+        self.proj = layers.Dense(
+            self.latent_dim,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
+            name=f"{self.name}_proj_dense"
         )
+        self.dropout = layers.Dropout(self.dropout_rate)
+        self.activity = layers.ActivityRegularization(l2=self.activity_l2)
+        super().build(input_shapes)
+
+    def top_k_mean(self, x):
+        # x shape [batch, seq_len, filters]
+        x_t = tf.transpose(x, [0, 2, 1])  # [batch, filters, seq_len]
+        values, _ = tf.nn.top_k(x_t, k=self.top_k)    # [batch, filters, k]
+        return tf.reduce_mean(values, axis=-1)        # [batch, filters]
+
+    def call(self, inputs, training=None):
+        local_conv, local_gate = inputs
+
+        # 1) Elementwise gating
+        gated = local_conv * local_gate   # [..., filters]
+
+        # 2) Top-k mean pooling
+        pooled = self.top_k_mean(gated)
+
+        # 3) Dropout
+        pooled = self.dropout(pooled, training=training)
+
+        # 4) Projection
+        out = self.proj(pooled)
+
+        # 5) Optional L2 activity regularization
+        out = self.activity(out)
+        return out
 
     def get_config(self):
         config = super().get_config()
         config.update({
-            'num_heads': self.num_heads,
-            'key_dim': self.key_dim,
-            'dropout_rate': self.dropout_rate
+            "latent_dim": self.latent_dim,
+            "top_k": self.top_k,
+            "dropout_rate": self.dropout_rate,
+            "activity_l2": self.activity_l2,
         })
         return config
-    
-    def build(self, input_shape):
-        self.attention = layers.MultiHeadAttention(
-            num_heads=self.num_heads,
-            key_dim=self.key_dim,
-            dropout=self.dropout_rate
-        )
-        self.layer_norm = layers.LayerNormalization()
-        self.dropout = layers.Dropout(self.dropout_rate)
-        super().build(input_shape)
-    
-    def call(self, query, key, value, training=None):
-        attn_out = self.attention(query, key, value, training=training)
-        attn_out = attn_out * self.temperature  # Temperature scaled attention
-        return self.layer_norm(query + self.dropout(attn_out, training=training)) # Residual connection
 
 class PairwiseAdaptiveGate(layers.Layer):
     """
     Learns how much to trust the baseline correlation vs. predicted changes.
-    Includes initialization for stability and clamping to prevent baseline collapse.
     """
     def __init__(self, 
                  num_companies, 
-                 alpha_min=0.15,     # Minimum trust in baseline (ChatGPT idea)
+                 alpha_min=0.15,     # Minimum trust in baseline
                  hidden_units=64, 
-                 activity_l1=1e-4, 
-                 entropy_reg=1e-4,   # Encourage decisive gating (ChatGPT idea)
                  **kwargs):
         super().__init__(**kwargs)
         self.num_companies = num_companies
         self.alpha_min = alpha_min
-        self.activity_l1 = activity_l1
-        self.entropy_reg = entropy_reg
         self.hidden_units = hidden_units
 
         # Hidden projection
@@ -336,11 +485,13 @@ class PairwiseAdaptiveGate(layers.Layer):
         )
 
         # Logits output
+        # This starts the gate at sigmoid(0) = 0.5 (50% baseline, 50% delta)
+        # instead of sigmoid(1) = 0.73 which was killing the delta branch
         self.gate_logits = layers.Dense(
             1,
-            activation=None, # We apply sigmoid manually later
+            activation=None,
             kernel_regularizer=regularizers.l2(1e-6),
-            bias_initializer='ones', # Start with high trust in baseline!
+            bias_initializer='zeros',
             name="gate_logits"
         )
 
@@ -351,51 +502,194 @@ class PairwiseAdaptiveGate(layers.Layer):
         config.update({
             "num_companies": self.num_companies,
             "alpha_min": self.alpha_min,
-            "hidden_units": self.hidden_units,
-            "activity_l1": self.activity_l1,
-            "entropy_reg": self.entropy_reg
+            "hidden_units": self.hidden_units
         })
         return config
 
-    def call(self, inputs, baseline_corr):
-        # inputs: merged_features [batch, N, N, features]
-        
+    def call(self, inputs, baseline_corr):        
         # 1. Hidden layer
-        gate_hidden = self.gate_hidden(inputs) # [batch, N, N, 64]
+        gate_hidden = self.gate_hidden(inputs)
 
-        # 2. Logits -> Sigmoid
-        # Mivel a bias=1, ez kezdetben sigmoid(1) ~= 0.73 lesz
-        raw_alpha = tf.sigmoid(self.gate_logits(gate_hidden)) # [batch, N, N, 1]
+        # 2. Gate predicts alpha per pair
+        raw_alpha = tf.sigmoid(self.gate_logits(gate_hidden))
+
+        # 3. Clamping: ensure alpha never goes below alpha_min
+        alpha = self.reshape(raw_alpha) * (1.0 - self.alpha_min) + self.alpha_min
         
-        # 3. Reshape
-        alpha = self.reshape(raw_alpha) # [batch, N, N]
-
-        # 4. Clamping (ChatGPT okos ötlete)
-        # Biztosítjuk, hogy alpha sose menjen alpha_min alá
-        # Képlet: alpha_skálázott = alpha * (1 - min) + min
-        alpha = alpha * (1.0 - self.alpha_min) + self.alpha_min
-
-        # 5. Sparsity Regularization (Ne akarjon mindenhol eltérni)
-        if self.activity_l1 > 0.0:
-            # Büntetjük, ha az alpha csökken (tehát ha eltérünk a baseline-tól)
-            # Minél kisebb az alpha (távolodunk az 1-től), annál nagyobb a büntetés?
-            # Nem, itt az aktivitást büntetjük.
-            # Helyesebb inkább a (1-alpha)-t büntetni, ha a baseline-hoz ragaszkodást akarjuk.
-            # De maradjunk az egyszerű activity regnél a gate neuronokon.
-            self.add_loss(self.activity_l1 * tf.reduce_mean(tf.abs(raw_alpha)))
-
-        # 6. Entropy Regularization (Legyen határozott)
-        if self.entropy_reg > 0.0:
-            # Shannon entrópia minimalizálása: p*log(p)
-            p = alpha
-            # Epszilon a 0 logaritmus elkerülésére
-            entropy = - (p * tf.math.log(p + 1e-8) + (1 - p) * tf.math.log(1 - p + 1e-8))
-            self.add_loss(self.entropy_reg * tf.reduce_mean(entropy))
-
-        # 7. Gated Baseline
+        # 4. Gated Baseline
         gated_baseline = layers.Multiply()([baseline_corr, alpha])
-
         return gated_baseline
+
+class DeltaHead(layers.Layer):
+    """
+    Predicts the symmetric mean change (μ_ij) and log-variance (log σ²_ij) for each pair.
+    
+    Features:
+      - Shared non-linear projection with Dropout
+      - Symmetric output enforcement (M_ij = M_ji)
+      - Diagonal zeroing (correlation change with self is always 0)
+      - Optional L1 activity regularization on μ (prevents lazy zero-prediction)
+    """
+
+    def __init__(self, 
+                 hidden_units=128, 
+                 dropout_rate=0.5, 
+                 delta_l1=1e-4, # Penalty for non-zero changes (sparsity)
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_units = hidden_units
+        self.dropout_rate = dropout_rate
+        self.delta_l1 = delta_l1
+
+        self.hidden = layers.Dense(
+            hidden_units,
+            activation='tanh',
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
+            name="delta_shared_hidden"
+        )
+
+        self.dropout = layers.Dropout(dropout_rate)
+
+        # Heads for mu and log_var
+        # Using linear activation to allow full range
+        self.mu_head = layers.Dense(1, activation='linear', name="delta_mu_raw")
+        self.var_head = layers.Dense(1, activation='linear', name="delta_logvar_raw")
+
+    def call(self, inputs, training=None):
+        # inputs: [batch, N, N, features]
+        
+        # 1. Shared representation
+        h = self.hidden(inputs)
+        
+        # MC Dropout logic: if training=True (during fit), dropout is active.
+        # During inference, it's inactive unless we manually force it (for MC sampling).
+        h = self.dropout(h, training=training)
+
+        # 2. Raw predictions [batch, N, N, 1]
+        mu_raw = self.mu_head(h)
+        logvar_raw = self.var_head(h)
+
+        # Remove last dimension -> [batch, N, N]
+        mu = tf.squeeze(mu_raw, axis=-1)
+        logvar = tf.squeeze(logvar_raw, axis=-1)
+
+        # 3. For stability prevent exploding gradients or numerical instability in Loss
+        logvar = tf.clip_by_value(logvar, -6.0, 6.0)
+
+        # 4. Enforce Symmetry: M_sym = 0.5 * (M + M^T)
+        # Transpose only the last two dimensions (N, N)
+        mu_sym = 0.5 * (mu + tf.linalg.matrix_transpose(mu))
+        logvar_sym = 0.5 * (logvar + tf.linalg.matrix_transpose(logvar))
+
+        # 5. Enforce Zero Diagonal (Self-correlation change is 0)
+        n = tf.shape(mu_sym)[-1]
+        diag_mask = tf.expand_dims(1.0 - tf.eye(n), axis=0)
+        
+        mu_final = mu_sym * diag_mask
+        logvar_final = logvar_sym * diag_mask
+
+        # 6. Activity Regularization
+        # Penalize magnitude of changes to encourage sparsity (only significant changes)
+        if self.delta_l1 > 0.0:
+            self.add_loss(self.delta_l1 * tf.reduce_mean(tf.abs(mu_final)))
+
+        return mu_final, logvar_final
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "hidden_units": self.hidden_units,
+            "dropout_rate": self.dropout_rate,
+            "delta_l1": self.delta_l1
+        })
+        return config
+
+class SharedNewsRepresentation(layers.Layer):
+    """
+    Builds the final shared news representation by combining:
+    - global news features (smooth_global)
+    - local edge features (local_edge_proj)
+
+    Applies a Dense → LayerNorm → Dropout pipeline.
+    """
+
+    def __init__(self, latent_dim, dropout_rate=0.36, **kwargs):
+        super().__init__(**kwargs)
+        self.latent_dim = latent_dim
+        self.dropout_rate = dropout_rate
+
+        self.proj = layers.Dense(
+            latent_dim,
+            activation='relu',
+            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
+            name="shared_news_representation"
+        )
+        self.norm = layers.LayerNormalization(name="shared_news_layernorm")
+        self.drop = layers.Dropout(dropout_rate, name="shared_news_dropout")
+
+    def call(self, smooth_global, local_edge_proj, training=None):
+        x = tf.concat([smooth_global, local_edge_proj], axis=-1)
+        x = self.proj(x)
+        x = self.norm(x)
+        x = self.drop(x, training=training)
+        return x
+
+    def get_config(self):
+        return {
+            "latent_dim": self.latent_dim,
+            "dropout_rate": self.dropout_rate
+        }
+
+class PairwiseFeatureBuilder(layers.Layer):
+    """
+    Constructs pairwise features and also returns the computed company embeddings.
+
+    Output (tuple):
+    1. pairwise: [batch, N, N, 2*company_dim + latent_dim]
+    2. company_emb: [batch, N, company_dim]
+    """
+
+    def __init__(self, num_companies, company_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.num_companies = num_companies
+        self.company_dim = company_dim
+
+        self.company_embedding = layers.Embedding(
+            input_dim=num_companies,
+            output_dim=company_dim,
+            embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
+            name="company_embeddings"
+        )
+        
+        self.concat_layer = layers.Concatenate(axis=-1, name='pairwise_concat')
+
+    def call(self, shared_news_rep):
+        batch_size = tf.shape(shared_news_rep)[0] 
+        
+        # 1. Company embeddings
+        all_indices = tf.tile(tf.expand_dims(tf.range(self.num_companies, dtype=tf.int32), 0), [batch_size, 1])
+        company_emb = self.company_embedding(all_indices)
+
+        # 2. Pairwise expansion
+        company_i = tf.tile(tf.expand_dims(company_emb, 2), [1, 1, self.num_companies, 1])
+        company_j = tf.tile(tf.expand_dims(company_emb, 1), [1, self.num_companies, 1, 1])
+        news = tf.tile(
+            tf.expand_dims(tf.expand_dims(shared_news_rep, 1), 1),
+            [1, self.num_companies, self.num_companies, 1]
+        )
+
+        # 3. Concatenate
+        pairwise = self.concat_layer([company_i, company_j, news])
+
+        return pairwise, company_emb
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_companies": self.num_companies,
+            "company_dim": self.company_dim,
+        })
+        return config
 
 class AttentionBasedNewsFactorModel:
     """
@@ -405,7 +699,7 @@ class AttentionBasedNewsFactorModel:
     3. Weighted loss focusing on important pairs
     """
 
-    def __init__(self, tokenizer, bert_model, num_companies, min_sigma=8e-4, max_keywords=128, keyword_dim=256, company_dim=128, latent_dim=256):
+    def __init__(self, tokenizer, bert_model, num_companies, min_sigma=0.01, max_keywords=128, keyword_dim=256, company_dim=128, latent_dim=256):
         self.tokenizer = tokenizer
         self.bert_model = bert_model
         self.num_companies = num_companies
@@ -429,28 +723,30 @@ class AttentionBasedNewsFactorModel:
                 initial_learning_rate=1e-4,
                 first_decay_steps=2000,
                 t_mul=2.0,
-                m_mul=0.85,
-                alpha=0.1
+                m_mul=0.76,
+                alpha=0.02
             ),
-            weight_decay=1e-4,
+            weight_decay=2e-4,
             clipnorm=1.0
         )
         
         self.model.compile(
             optimizer=optimizer,
             loss={
-                'correlation_changes_probabilistic': WeightedNegativeLogLikelihoodLoss(
+                'correlation_changes_probabilistic': CompoundProbabilisticLoss(
                     min_sigma=self.min_sigma,
-                    affected_weight=3.3, # weight for pairs with affected companies
-                    magnitude_weight=1.2, # weight per unit of actual change
-                    variance_penalty_weight=2e-4,
-                    variance_floor=8e-3
+                    affected_weight=3.3,
+                    magnitude_weight=1.8,
+                    lambda_var=1e-4,
+                    lambda_dir=2e-2,
+                    high_conf_threshold=0.85,
+                    directional_margin=0.04
                 ),
                 'price_deviations': losses.Huber(delta=1.0),
                 'news_reconstruction': 'mae'
             },
             loss_weights={
-                'correlation_changes_probabilistic': 3.0,
+                'correlation_changes_probabilistic': 5.0,
                 'price_deviations': 0.5,
                 'news_reconstruction': 0.5
             },
@@ -461,10 +757,9 @@ class AttentionBasedNewsFactorModel:
             }
         )
 
-    def build_model(self, use_local_branch: bool = True, top_k: int = 3):
+    def build_model(self, top_k: int = 3):
         """Multi-task model with Residual Probabilistic Residual Learning.
-        Hybrid news encoder with controlled local-edge branch (Option 4).
-        - use_local_branch: whether to include the local edge path (toggleable)
+        Hybrid news encoder with controlled local-edge branch
         - top_k: number of top activations to aggregate from local conv (soft top-k mean)
         """
 
@@ -490,189 +785,102 @@ class AttentionBasedNewsFactorModel:
             name='keyword_embeddings'
         )(keyword_input)  # [batch, seq_len, keyword_dim]
 
-        attn_keywords = OptimizedAttentionLayer(
+        smooth_global, processed_keywords = KeywordEncoderBlock(
             num_heads=8,
             key_dim=max(1, self.keyword_dim // 8),
-            dropout_rate=0.22,
-            name='keyword_attention'
-        )(keyword_embedding, keyword_embedding, keyword_embedding)
-
-        # Residual connection + LayerNorm for stable per-token features
-        processed_keywords = layers.LayerNormalization(name='keywords_layer_norm')(attn_keywords + keyword_embedding) # shape: [batch, seq_len, keyword_dim]
+            latent_dim=self.latent_dim,
+            dropout_rate=0.2,
+            name='keyword_encoder'
+        )(keyword_embedding)
 
         # -----------------------------
-        # 3. Smooth global branch (robust)
+        # 3. Controlled local branch
         # -----------------------------
-        # Average + Max pooling across tokens -> stable global descriptor
-        news_features = layers.Concatenate(name='news_smooth_global')([
-            layers.GlobalAveragePooling1D(name='keywords_global_avg')(processed_keywords),
-            layers.GlobalMaxPooling1D(name='keywords_global_max')(processed_keywords)
-        ]) # [batch, 2*keyword_dim]
-
-        # Small projection to latent_dim (keeps global descriptor compact and regularized)
-        smooth_global = layers.Dense(
-            self.latent_dim,
+        # small conv filter bank
+        local_filters = max(32, self.latent_dim // 4)
+        # 1D convolutional layer is able to examine n-grams (e.g. kernel 3 = 3 words) at once, making it much more robust in recognizing "semantic edges" and less prone to noise.
+        local_conv = layers.Conv1D(
+            filters=local_filters,
+            kernel_size=3,
+            padding='same',
             activation='relu',
             kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
-            name='smooth_global_proj'
-        )(news_features)  # [batch, latent_dim]
+            name='local_conv_small'
+        )(processed_keywords)  # [batch, seq_len, local_filters]
+
+        # adaptive gating over the local features with L1 activity regularization
+        local_gate = AdaptiveGate(
+            units=local_filters,
+            initial_temperature=1.0,
+            activity_l1=1e-3,
+            name="local_gate"
+        )(processed_keywords)
 
         # -----------------------------
-        # 4. Controlled local branch (OPTIONAL, robustified)
+        # 4. Elementwise multiply conv features with gate
         # -----------------------------
-        if use_local_branch:
-
-            # 4.a Small conv filter bank
-            local_filters = max(32, self.latent_dim // 4)
-            # 1D convolutional layer is able to examine n-grams (e.g. kernel 3 = 3 words) at once, making it much more robust in recognizing "semantic edges" and less prone to noise.
-            local_conv = layers.Conv1D(
-                filters=local_filters,
-                kernel_size=3,
-                padding='same',
-                activation='relu',
-                kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
-                name='local_conv_small'
-            )(processed_keywords)  # [batch, seq_len, local_filters]
-
-            # 4.b  Adaptive gating over the local features with L1 activity regularization
-            local_gate = TemperatureGatedDense(
-                units=local_filters,
-                initial_temperature=1.0,
-                activity_l1=1e-3,
-                name="local_gate"
-            )(processed_keywords)
-
-            # 4.c Elementwise multiply conv features with gate
-            gated_local = layers.Multiply(name='gated_local')([local_conv, local_gate])  # [batch, seq_len, local_filters]
-
-            # 4.d Top-k mean pooling
-            def top_k_mean(x):
-                # x shape: [batch, seq_len, filters]
-                # transpose so we perform top-k over seq_len for each filter
-                x_t = tf.transpose(x, [0, 2, 1])  # [batch, filters, seq_len]
-                values, _ = tf.nn.top_k(x_t, k=top_k)  # [batch, filters, k]
-                return tf.reduce_mean(values, axis=-1)  # [batch, filters]
-            
-            local_edge = layers.Lambda(top_k_mean, name='local_topk')(gated_local)
-
-            # 4.e Small dropout on local_edge to further reduce overfitting
-            local_edge = layers.Dropout(0.4, name='local_edge_dropout')(local_edge)
-
-            # 4.f Projection to latent_dim to match smooth_global size
-            local_edge_proj = layers.Dense(
-                self.latent_dim,
-                activation='relu',
-                kernel_regularizer=regularizers.l1_l2(1e-6, 1e-5),
-                name='local_edge_proj'
-            )(local_edge)
-
-        else:
-            # Disabled mode (ablation)
-            local_edge_proj = tf.zeros([tf.shape(keyword_input)[0], self.latent_dim], dtype=tf.float32)
-        
-        local_edge_proj = layers.ActivityRegularization(l2=1e-4)(local_edge_proj)
+        local_edge_proj = LocalEdgeBlock(
+            latent_dim=self.latent_dim,
+            top_k=top_k,
+            dropout_rate=0.35,
+            activity_l2=1e-4,
+            name="local_edge_block"
+        )([local_conv, local_gate])
 
         # -----------------------------
         # 5. Combine branches -> shared_news_rep
         # -----------------------------
-        combined = layers.Concatenate(name='news_combined')([smooth_global, local_edge_proj])  # [batch, 2*latent_dim]
-
-        # Single moderate Dense to produce final shared news representation
-        # Keep this layer intentionally small/cautious to avoid creating "bumpiness".
-        shared_news_rep = layers.Dense(
-            self.latent_dim,
-            activation='relu',
-            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
-            name='shared_news_representation'
-        )(combined)  # [batch, latent_dim]
-
-        # Use LayerNorm (not BatchNorm) and small Dropout for stability without erasing edges
-        shared_news_rep = layers.LayerNormalization(name='shared_news_layernorm')(shared_news_rep)
-        shared_news_rep = layers.Dropout(0.36, name='shared_news_dropout')(shared_news_rep)
+        shared_news_rep = SharedNewsRepresentation(
+            latent_dim=self.latent_dim, 
+            dropout_rate=0.35
+        )(smooth_global, local_edge_proj) # [batch, latent_dim]
 
         # -----------------------------
-        # 6. Company embeddings (for pairwise features only)
+        # 6. Company embeddings and pairwise features
         # -----------------------------
-        # Create learnable company embeddings for ALL companies
-        company_embedding_layer = layers.Embedding(
-            input_dim=self.num_companies,
-            output_dim=self.company_dim,
-            embeddings_regularizer=regularizers.l1_l2(1e-5, 1e-4),
-            name='company_embeddings'
-        )
-
-        # Get embeddings for all companies repeating across batch dimension
-        batch_size = tf.shape(keyword_input)[0]
-        all_company_indices = tf.range(self.num_companies, dtype=tf.int32)
-        all_company_indices = tf.tile(tf.expand_dims(all_company_indices, 0), [batch_size, 1]) # [batch, N]
-        all_company_embeddings = company_embedding_layer(all_company_indices)  # [batch, N, company_dim]
-
-        # Create pairwise features: for each pair (i,j), concatenate [company_i, company_j, news]
-        # company_i: [batch, N, 1, company_dim] -> tile to [batch, N, N, company_dim]
-        company_i = tf.tile(tf.expand_dims(all_company_embeddings, 2), [1, 1, self.num_companies, 1])
-
-        # company_j: [batch, 1, N, company_dim] -> tile to [batch, N, N, company_dim]
-        company_j = tf.tile(tf.expand_dims(all_company_embeddings, 1), [1, self.num_companies, 1, 1])
-
-        # shared_news_rep: [batch, latent] -> expand to [batch, N, N, latent]
-        news_for_pairs = tf.tile(tf.expand_dims(tf.expand_dims(shared_news_rep, 1), 1), [1, self.num_companies, self.num_companies, 1]) # [batch, N, N, latent]
-
-        # Concatenate company_i, company_j, news_for_pairs along the last axis
-        pairwise_features = layers.Concatenate(axis=-1, name='pairwise_concat')([company_i, company_j, news_for_pairs]) # shape: [batch, N, N, 2*company_dim + latent]
-
-        # -----------------------------
-        # 7. Probabilistic residual head: Predict correlation CHANGE (delta)
-        # -----------------------------
-        # Flatten baseline correlation into a channel for concatenation
-        baseline_flat = tf.expand_dims(baseline_correlation_input, -1)  # [batch, N, N, 1]
-
-        # Merge pairwise features with baseline correlation
-        merged_features = layers.Concatenate(axis=-1, name='merged_features_with_baseline')([
-            pairwise_features,
-            baseline_flat
-        ])  # shape: [batch, N, N, 2*company_dim + latent + 1]
-
-        # Shared hidden layer for both μ and log-variance predictions
-        delta_hidden = layers.Dense(
-            128,
-            activation='tanh',
-            kernel_regularizer=regularizers.l1_l2(1e-5, 1e-4),
-            name='delta_hidden_shared'
-        )(merged_features)
-        delta_hidden = layers.Dropout(0.45, name='delta_hidden_dropout')(delta_hidden)
-        # TWO SEPARATE DENSE LAYERS for different predictions for Mean (μ) and Log-Variance (log σ²)
-
-        # μ: expected correlation change
-        delta_mu = tf.squeeze(layers.Dense(1, activation='linear', name='correlation_delta_mu')(delta_hidden), axis=-1) # [batch, N, N]
-
-        # log(σ²): aleatoric uncertainty
-        delta_log_var_raw = layers.Dense(1, activation='linear', name='correlation_delta_log_var')(delta_hidden)  # [batch, N, N, 1]
-        delta_log_var = tf.squeeze(tf.clip_by_value(delta_log_var_raw, -1.1, 5.9), axis=-1)  # [batch, N, N]
-
-        # Ensure symmetry for μ and log_var (average with transpose)
-        delta_mu_symmetric = 0.5 * (delta_mu + tf.transpose(delta_mu, perm=[0, 2, 1]))
-        delta_log_var_symmetric = 0.5 * (delta_log_var + tf.transpose(delta_log_var, perm=[0, 2, 1]))
-
-        # GATED RESIDUAL: Learn how much to trust baseline vs. delta
-        # Gate predicts alpha per pair: 1=full baseline, 0=full delta
-        pairwise_gate = PairwiseAdaptiveGate(
+        pairwise_features, all_company_embeddings = PairwiseFeatureBuilder(
             num_companies=self.num_companies,
-            name='pairwise_adaptive_gate'
-        )
-        gated_baseline = pairwise_gate(merged_features, baseline_correlation_input)
-        
+            company_dim=self.company_dim
+        )(shared_news_rep) # [batch, N, N, 2*company_dim + latent]
+
+        # -----------------------------
+        # 7. Predict correlation CHANGE (delta)
+        # -----------------------------
+        # Delta Head: Predicts symmetric μ and log(σ²) using FULL context
+        delta_mu_symmetric, delta_log_var_symmetric = DeltaHead(
+            hidden_units=128,
+            dropout_rate=0.35,
+            delta_l1=2e-4, # Sparsity for delta values
+            name="delta_head"
+        )(pairwise_features)  # Uses baseline for context
+
+        # -----------------------------
+        # 8. Probabilistic residual predictions
+        # -----------------------------
+        # Adaptive Gate: Predicts trust level using ONLY news+companies
+        gated_baseline = PairwiseAdaptiveGate(
+            num_companies=self.num_companies,
+            alpha_min=0.15,   # At least 15% baseline always remains
+            hidden_units=64,
+            name="pairwise_gate"
+        )(pairwise_features, baseline_correlation_input)  # Baseline passed separately
+
         # Gated residual: α*baseline + delta
         correlation_mean = layers.Add(name='correlation_mean_prediction')([gated_baseline, delta_mu_symmetric])
-        # Stack mean and log-variance for downstream probabilistic loss
-        correlation_changes_prob = layers.Lambda(lambda tensors: tf.stack(tensors, axis=-1), name='correlation_changes_probabilistic')([correlation_mean, delta_log_var_symmetric]) # [batch, N, N, 2]
+
+        # Stack mean and log-variance for probabilistic loss
+        correlation_changes_prob = layers.Lambda(
+            lambda tensors: tf.stack(tensors, axis=-1), 
+            name='correlation_changes_probabilistic'
+        )([correlation_mean, delta_log_var_symmetric])
 
         # -----------------------------
-        # 8. Price deviations & reconstruction heads
+        # 9. Price deviations & reconstruction heads
         # -----------------------------
         # For price deviation, use shared_news_rep combined with flattened company embeddings
         price_dev_input = layers.Concatenate(name='price_dev_input')([shared_news_rep, layers.Flatten()(all_company_embeddings)])
         price_dev_hidden = layers.Dense(128, activation='relu', name='price_dev_hidden')(price_dev_input)
-        price_dev_hidden = layers.Dropout(0.29, name='price_dev_dropout')(price_dev_hidden)
+        price_dev_hidden = layers.Dropout(0.25, name='price_dev_dropout')(price_dev_hidden)
         price_deviations = layers.Dense(self.num_companies, activation='tanh', name='price_deviations')(price_dev_hidden) # [batch, N]
 
         # Encourage shared_news_rep to preserve reconstructible information
@@ -808,21 +1016,15 @@ class AttentionBasedNewsFactorModel:
         Monte Carlo Dropout uncertainty + reconstruction-based confidence.
 
         Args:
-            keywords: Tokenized keywords
+            text: Input text
             baseline_correlation: Baseline correlation matrix
-            news_target_embedding: Ground truth BERT embedding of the news (for reconstruction error)
             n_samples: Number of MC Dropout samples (default: 30)
 
         Returns:
-            A dictionary containing the average MC Dropout prediction (mc_mu),
-            the prediction uncertainty (mc_logvar), the estimated price deviations,
-            and the reconstruction error of the news embedding.
+            Dictionary with MC predictions, uncertainties, price deviations, and reconstruction error
         """
 
-        # ----------------------------
-        # 1) Ensure correct shapes
-        # ----------------------------
-        # keywords: [batch, max_keywords]
+        # Prepare inputs
         keywords = self.prepare_keyword_sequence(text)
         if keywords.ndim == 1:
             keywords = keywords[None, :]
@@ -832,21 +1034,16 @@ class AttentionBasedNewsFactorModel:
         if news_target_embedding.ndim == 1:
             news_target_embedding = news_target_embedding.reshape(1, -1)
         
-        # baseline: must be [batch, N, N]
         if baseline_correlation.ndim == 2:
             baseline_correlation = baseline_correlation[None, ...]
 
-        # ----------------------------
-        # 2) Monte Carlo Dropout: multiple forward passes with dropout enabled
-        # ----------------------------
+        # Monte Carlo Dropout sampling
         mc_mu, mc_logvar = [], []
         keywords_tf = tf.convert_to_tensor(keywords, dtype=tf.int32)
         baseline_tf = tf.convert_to_tensor(baseline_correlation, dtype=tf.float32)
         
         for _ in range(n_samples):
-            # Use __call__() instead of predict() to respect training=True, this ensures Dropout layers are active during inference
             pred = self.model([keywords_tf, baseline_tf], training=True)
-            
             mu_sample = pred[0][..., 0].numpy()
             logvar_sample = pred[0][..., 1].numpy()
             mc_mu.append(mu_sample)
@@ -855,9 +1052,7 @@ class AttentionBasedNewsFactorModel:
         mc_mu = np.stack(mc_mu, axis=0)
         mc_logvar = np.stack(mc_logvar, axis=0)
 
-        # ----------------------------
-        # 3) Reconstruction error (using predict for final deterministic output)
-        # ----------------------------
+        # Reconstruction error
         final_pred = self.model.predict([keywords, baseline_correlation], verbose=0)
         recon_prediction = final_pred[2]  # shape [1, latent_dim]
         min_len = min(recon_prediction.shape[-1], news_target_embedding.shape[-1])
@@ -903,7 +1098,7 @@ class AttentionBasedNewsFactorModel:
         if text_key in self._bert_cache:
             return self._bert_cache[text_key].copy()
 
-        # Tokenize to numpy → convert to TF tensors
+        # Tokenize and get embedding
         inputs = self.tokenizer(
             text,
             truncation=True,
@@ -916,6 +1111,6 @@ class AttentionBasedNewsFactorModel:
         embedding_full = self.bert_model(inputs).last_hidden_state[:, 0, :].numpy()[0]  # shape (768,)
         embedding_sliced = embedding_full[:self.latent_dim] # shape (256,)
 
-        # Cache the SLICED result
+        # Cache the result
         self._bert_cache[text_key] = embedding_sliced.copy()
         return embedding_sliced
